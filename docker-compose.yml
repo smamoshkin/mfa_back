@@ -1,0 +1,131 @@
+version: '3.8'
+
+services:
+  # База данных (PostgreSQL) – используем существующие данные, поэтому volumes важны
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: marketfinance_db
+      POSTGRES_USER: marketfinance_user
+      POSTGRES_PASSWORD: ${DB_PASSWORD}  # берём из .env
+    volumes:
+      - ./postgres_data:/var/lib/postgresql/data
+      - ./backup:/backup
+    restart: unless-stopped
+    command: >
+      postgres
+      -c shared_buffers=128MB
+      -c effective_cache_size=256MB
+    networks:
+      - wb_network
+    ports:
+      - "127.0.0.1:5432:5432"   # проброс только на localhost
+
+  # Redis
+  redis:
+    image: redis:7-alpine
+    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
+    volumes:
+      - ./redis_data:/data
+    ports:
+      - "6379:6379"   # Временно открываем порт для отладки
+    restart: unless-stopped
+    networks:
+      - wb_network
+
+  # Бэкенд (Flask/FastAPI)
+  backend:
+#    ports:
+#      - "8000:8000"
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: wb_backend
+    restart: always
+    environment:
+      - FLASK_ENV=production
+      - DATABASE_URL=postgresql://marketfinance_user:${DB_PASSWORD}@db:5432/marketfinance_db
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY}
+      - API_WB_KEY=${API_WB_KEY}
+      - ROOT_PATH=/api
+    depends_on:
+      - db
+      - redis
+    networks:
+      - wb_network
+    volumes:
+      - ./logs:/app/logs   # если нужно сохранять логи
+
+  # Celery worker
+  celery_worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: wb_celery
+    restart: always
+    entrypoint: ""          # <-- отключаем entrypoint.sh
+    command: celery -A app.celery_app worker --loglevel=info --concurrency=4
+    environment:
+      - FLASK_ENV=production
+      - DATABASE_URL=postgresql://marketfinance_user:${DB_PASSWORD}@db:5432/marketfinance_db
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - backend
+      - db
+      - redis
+    networks:
+      - wb_network
+
+  # Celery Beat — планировщик периодических задач
+  celery_beat:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: wb_celery_beat
+    restart: always
+    entrypoint: ""          # отключаем entrypoint.sh как у worker
+    command: celery -A app.celery_app beat --loglevel=info --scheduler celery.beat.PersistentScheduler
+    environment:
+      - FLASK_ENV=production
+      - DATABASE_URL=postgresql://marketfinance_user:${DB_PASSWORD}@db:5432/marketfinance_db
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - backend
+      - db
+      - redis
+    volumes:
+      - ./celerybeat_data:/app/celerybeat_data   # персистентное хранилище расписания
+    networks:
+      - wb_network
+
+  # Фронтенд
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: wb_frontend
+    restart: always
+    networks:
+      - wb_network
+
+  # Nginx (входные ворота)
+  nginx:
+    image: nginx:alpine
+    container_name: wb_nginx
+    restart: always
+    ports:
+      - "8080:80"
+   #   - "443:443"  # если будет HTTPS
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro  # если будут сертификаты
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - wb_network
+
+networks:
+  wb_network:
+    driver: bridge
