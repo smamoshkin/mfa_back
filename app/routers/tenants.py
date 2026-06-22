@@ -1,6 +1,6 @@
 # app/routers/tenants.py
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Body, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from datetime import date
@@ -143,7 +143,7 @@ def delete_existing_tenant(
 @router.patch("/{tenant_id}/set_wb_key", response_model=SyncLaunchResponse)
 def set_wb_api_key(
     tenant_id: int,
-    wb_api_key: str,
+    wb_api_key: str = Body(..., embed=True),
     current_tenant: Tenant = Depends(get_current_tenant),
     db: Session = Depends(get_db),
 ):
