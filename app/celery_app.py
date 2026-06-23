@@ -30,11 +30,6 @@ celery_app.conf.update(
     result_serializer='json',
     timezone='Europe/Moscow',
     enable_utc=True,
-    task_routes={
-        'app.tasks.sync_tasks.sync_tenant_wb_data':         {'queue': 'wb_sync'},
-        'run_weekly_sync_all_tenants':                       {'queue': 'wb_sync'},
-        'run_initial_sync_pending_tenants':                  {'queue': 'wb_sync'},
-    },
 )
 
 # ---------------------------------------------------------------------------
@@ -46,15 +41,13 @@ celery_app.conf.beat_schedule = {
     # Еженедельная синхронизация — каждый понедельник в 06:00 MSK
     'weekly-wb-sync': {
         'task': 'run_weekly_sync_all_tenants',
-        'schedule': crontab(hour=6, minute=0, day_of_week=1),
-        'options': {'queue': 'wb_sync'},
+        'schedule': crontab(hour=10, minute=0, day_of_week=1),
     },
 
     # Подхват зависших initial sync — каждый час в :00
     'retry-stalled-initial-sync': {
         'task': 'run_initial_sync_pending_tenants',
         'schedule': crontab(minute=0),
-        'options': {'queue': 'wb_sync'},
     },
 }
 
