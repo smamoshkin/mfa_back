@@ -196,13 +196,7 @@ class SyncService:
         
         # 3. Вставка в БД
         db_start = time.time()
-        created_reports = bulk_create_reports_DEBUG(db, reports_to_create, tenant.id)
-        
-        # 👇 Получаем количество вставленных записей
-        if isinstance(created_reports, list):
-            records_imported = len(created_reports)
-        else:
-            records_imported = created_reports if isinstance(created_reports, int) else 0
+        records_imported = bulk_create_reports_DEBUG(db, reports_to_create, tenant.id)
         
         db_time = time.time() - db_start
         

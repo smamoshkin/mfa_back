@@ -73,42 +73,37 @@ def bulk_create_reports_DEBUG(db: Session, reports: List[SupplierReportCreate], 
     
     total_inserted = 0
     batch_size = 10000
-    created_reports = []
-    
+
     try:
         for i in range(0, len(reports_data), batch_size):
             batch = reports_data[i:i + batch_size]
             batch_num = (i // batch_size) + 1
-            
+
             logger.info(f"⏱️  DEBUG Batch {batch_num}: Starting...")
-            
-            # 👇 ЗАМЕРЯЕМ КАЖДЫЙ ЭТАП
+
             prepare_time = time.time()
             stmt = insert(SupplierReport).values(batch)
             prepare_time = time.time() - prepare_time
-            
+
             execute_time = time.time()
-            result = db.execute(stmt)
+            db.execute(stmt)
             execute_time = time.time() - execute_time
-            
+
             commit_time = time.time()
             db.commit()
             commit_time = time.time() - commit_time
-            
+
             total_batch_time = prepare_time + execute_time + commit_time
             total_inserted += len(batch)
-            
+
             logger.info(f"⏱️  DEBUG Batch {batch_num} TIMING:")
             logger.info(f"⏱️    - Prepare: {prepare_time:.2f}s")
-            logger.info(f"⏱️    - Execute: {execute_time:.2f}s") 
+            logger.info(f"⏱️    - Execute: {execute_time:.2f}s")
             logger.info(f"⏱️    - Commit: {commit_time:.2f}s")
             logger.info(f"⏱️    - Total: {total_batch_time:.2f}s")
             logger.info(f"⏱️    - Speed: {len(batch)/execute_time:.1f} records/sec")
-            
-            for report_data in batch:
-                created_reports.append(SupplierReport(**report_data))
-        
-        return created_reports
+
+        return total_inserted
         
     except Exception as e:
         logger.error(f"❌ Bulk insert failed: {str(e)}")
