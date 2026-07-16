@@ -3,6 +3,7 @@
 from celery import Celery
 from celery.schedules import crontab
 from dotenv import load_dotenv
+import os
 
 load_dotenv()
 
@@ -12,8 +13,8 @@ load_dotenv()
 
 celery_app = Celery(
     'marketfinance',
-    broker='redis://94.103.91.204:6379/0',
-    backend='redis://94.103.91.204:6379/0',
+    broker=os.getenv('REDIS_URL'),
+    backend=os.getenv('REDIS_URL'),
     include=[
         'app.tasks.sync_tasks',
         'app.tasks.periodic_sync',   # регистрируем periodic задачи
@@ -30,6 +31,14 @@ celery_app.conf.update(
     result_serializer='json',
     timezone='Europe/Moscow',
     enable_utc=True,
+    broker_transport_options={
+        'socket_keepalive': True,
+        'socket_timeout': 10,          # таймаут на чтение/запись в сокет, сек
+        'socket_connect_timeout': 10,  # таймаут на установление соединения, сек
+        'retry_on_timeout': True,
+        'health_check_interval': 25,   # PING раз в 25 сек, чтобы обнаружить мёртвое соединение
+    },
+    broker_connection_retry_on_startup=True,
 )
 
 # ---------------------------------------------------------------------------
