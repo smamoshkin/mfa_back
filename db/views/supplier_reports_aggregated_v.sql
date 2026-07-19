@@ -94,7 +94,7 @@ AS SELECT sr.tenant_id,
             ELSE 0::numeric
         END) AS margin
    FROM supplier_reports sr
-     LEFT JOIN tax_rates tr ON sr.sale_dt >= tr.start_date AND sr.sale_dt <= COALESCE(tr.end_date, '9999-01-01'::date)
+     LEFT JOIN tax_rates tr ON tr.tenant_id = sr.tenant_id AND sr.sale_dt >= tr.start_date AND sr.sale_dt <= COALESCE(tr.end_date, '9999-01-01'::date)
      LEFT JOIN products p ON p.sku::text = sr.sku::text AND p.tenant_id = sr.tenant_id
      LEFT JOIN LATERAL ( SELECT pc_1.cost
            FROM product_costs pc_1
