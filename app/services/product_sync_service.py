@@ -65,47 +65,83 @@ class ProductSyncService:
         logger.info(f"📊 Найдено {len(unique_products)} уникальных продуктов")
         return unique_products
     
-    def sync_products_from_period(self, tenant_id: int, date_from: date, date_to: date) -> Dict[str, int]:
+    async def fetch_product_photo(self, api_key: str, sku: str) -> Optional[str]:
+        """
+        Запрашивает карточку товара в WB Content API по артикулу продавца (sku)
+        и возвращает ссылку на фото (square) первого найденного изображения.
+
+        Если у товара нет фото или карточка не найдена — возвращает None,
+        это нормальная ситуация, а не ошибка.
+        """
+        try:
+            cards = await self.wb_client.get_product_data_by_sku(
+                api_key=api_key, sku=sku, limit=1, with_photo=1
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось получить фото для {sku} из WB API: {str(e)}")
+            return None
+
+        if not cards:
+            return None
+
+        photos = cards[0].get('photos') or []
+        if not photos:
+            return None
+
+        return photos[0].get('square') or None
+
+    async def sync_products_from_period(self, tenant_id: int, date_from: date, date_to: date, api_key: Optional[str] = None) -> Dict[str, int]:
         """Синхронизируем продукты из отчетов за период"""
-        
+
         unique_products = self.extract_unique_products_from_period(tenant_id, date_from, date_to)
-        
+
         created_count = 0
         skipped_count = 0
-        
+
         for product_data in unique_products:
             try:
                 sku = product_data['sku']
-                
+
                 # Проверяем, существует ли уже продукт
                 existing_product = get_product_by_sku(self.db, tenant_id, sku)
-                
+
                 if not existing_product:
                     logger.info(f"Продукт {sku} не существует. Попробуем создать.")
                     # Создаем новый продукт с базовыми данными
                     product_create = ProductCreate(
-                        tenant_id=tenant_id,
                         sku=sku,
                         marketplace_sku=product_data['marketplace_sku'],
-                        name=product_data['name'],  
+                        name=product_data['name'],
                         category=product_data['category'] or "",
                         barcode=product_data['barcode'] or "",
                         is_active=True
                     )
                     logger.info(f"Для {sku} создали объект, пытаюсь вставить.")
-                    create_product(self.db, product_create.model_dump())
+                    product_dict = product_create.model_dump()
+                    product_dict['tenant_id'] = tenant_id
+                    new_product = create_product(self.db, product_dict)
                     created_count += 1
                     logger.debug(f"✅ Создан продукт: {sku}")
+
+                    # Фото подтягиваем только для нового товара — если у существующего
+                    # его нет, это не повод дёргать WB API при каждой синхронизации.
+                    if api_key:
+                        photo_url = await self.fetch_product_photo(api_key, sku)
+                        if photo_url:
+                            update_product(self.db, new_product.id, ProductUpdate(foto=photo_url))
+                            logger.debug(f"🖼️ Сохранено фото для продукта: {sku}")
+                        else:
+                            logger.debug(f"ℹ️ Фото для продукта {sku} не найдено в WB API")
                 else:
                     skipped_count += 1
                     logger.debug(f"⏭️ Пропущен существующий продукт: {sku}")
-                    
+
             except Exception as e:
                 logger.error(f"❌ Ошибка при синхронизации продукта {product_data.get('sku')}: {str(e)}")
                 continue
-        
+
         logger.info(f"🎯 Синхронизация завершена: создано {created_count}, пропущено {skipped_count}")
-        
+
         return {
             'created': created_count,
             'skipped': skipped_count,
@@ -174,15 +210,15 @@ class ProductSyncService:
             'total_processed': len(skus)
         }
     
-    def sync_and_enrich_products(self, tenant_id: int, date_from: date, date_to: date) -> Dict[str, Any]:
+    async def sync_and_enrich_products(self, tenant_id: int, date_from: date, date_to: date) -> Dict[str, Any]:
         """
         Полная синхронизация: извлечение продуктов + обогащение из API
         """
-        
+
         logger.info(f"🚀 Запускаем полную синхронизацию продуктов для tenant_id={tenant_id}")
-        
+
         # Шаг 1: Синхронизируем продукты из отчетов
-        sync_stats = self.sync_products_from_period(tenant_id, date_from, date_to)
+        sync_stats = await self.sync_products_from_period(tenant_id, date_from, date_to)
         
         # Шаг 2: Получаем список SKU для обогащения
         unique_products = self.extract_unique_products_from_period(tenant_id, date_from, date_to)
@@ -200,18 +236,18 @@ class ProductSyncService:
         logger.info(f"🎯 Полная синхронизация завершена: {result}")
         return result
     
-    def batch_sync_products(self, tenant_id: int, periods: List[Dict[str, date]]) -> Dict[str, int]:
+    async def batch_sync_products(self, tenant_id: int, periods: List[Dict[str, date]]) -> Dict[str, int]:
         """Пакетная синхронизация за несколько периодов"""
-        
+
         total_stats = {'created': 0, 'skipped': 0, 'total_processed': 0}
-        
+
         for period in periods:
             date_from = period['date_from']
             date_to = period['date_to']
-            
+
             logger.info(f"🔄 Синхронизация продуктов за период {date_from} - {date_to}")
-            
-            stats = self.sync_products_from_period(tenant_id, date_from, date_to)
+
+            stats = await self.sync_products_from_period(tenant_id, date_from, date_to)
             
             for key in total_stats:
                 total_stats[key] += stats[key]

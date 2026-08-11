@@ -14,7 +14,6 @@ class ProductBase(BaseModel):
     is_active: bool = True
 
 class ProductCreate(ProductBase):
-    tenant_id: int # tenant_id НЕ ДОЛЖЕН быть здесь - он берется из токена
     sku: str
     marketplace_sku: str
     name: str = ""

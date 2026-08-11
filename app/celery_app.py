@@ -31,6 +31,12 @@ celery_app.conf.update(
     result_serializer='json',
     timezone='Europe/Moscow',
     enable_utc=True,
+    # Единая очередь по умолчанию для всех задач проекта. Раньше её нигде не было
+    # задано, поэтому задачи публиковались в дефолтную очередь Celery ('celery'),
+    # а задокументированная команда воркера (-Q wb_sync) её не видела — задачи
+    # молча зависали в Redis. Прод "работал" только потому, что воркер там
+    # запускается без -Q вообще и слушает ту же дефолтную очередь, что и паблишер.
+    task_default_queue='wb_sync',
     broker_transport_options={
         'socket_keepalive': True,
         'socket_timeout': 10,          # таймаут на чтение/запись в сокет, сек

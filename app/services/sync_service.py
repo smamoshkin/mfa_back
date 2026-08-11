@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from app.services.wb_api_client import WBAPIClient
 from app.services.report_mapper import ReportMapperService
 from app.services.product_sync_service import ProductSyncService  # 👈 Добавляем
+from app.services.stock_sync_service import StockSyncService
 from app.crud.supplier_report_crud import bulk_create_reports_DEBUG
 from app.models.tenant import Tenant
 import logging
@@ -36,7 +37,8 @@ class SyncService:
             'api_calls': 0,
             'batches_processed': 0,
             'last_rrdid': 0,
-            'products_synced': 0  # 👈 Добавляем метрику для продуктов
+            'products_synced': 0,  # 👈 Добавляем метрику для продуктов
+            'stocks_updated': 0
         }
         
         start_time = time.time()
@@ -85,9 +87,19 @@ class SyncService:
                 metrics['products_synced'] = products_metrics['created']
             else:
                 logger.info("⏭️ Product sync skipped")
-            
+
+            # ШАГ СИНХРОНИЗАЦИИ ОСТАТКОВ — не зависит от того, были ли новые
+            # продажи на этой неделе, только от наличия товаров и API-ключа
+            if sync_products and tenant.wb_api_key:
+                stock_metrics = await self._sync_product_stocks(
+                    db=db,
+                    tenant=tenant,
+                    week_start=date_from
+                )
+                metrics['stocks_updated'] = stock_metrics['products_updated']
+
             metrics['total_time'] = time.time() - start_time
-            
+
             logger.info(f"""
 🎯 PAGINATED SYNC COMPLETE:
 ├── Total time: {metrics['total_time']:.2f}s
@@ -95,6 +107,7 @@ class SyncService:
 ├── API calls: {metrics['api_calls']}
 ├── Batches processed: {metrics['batches_processed']}
 ├── Products synced: {metrics['products_synced']}
+├── Stocks updated: {metrics['stocks_updated']}
 └── Last rrdid: {metrics['last_rrdid']}
 """)
             
@@ -118,12 +131,13 @@ class SyncService:
         
         try:
             product_sync_service = ProductSyncService(db)
-            
+
             # Синхронизируем продукты из отчетов за период
-            products_stats = product_sync_service.sync_products_from_period(
+            products_stats = await product_sync_service.sync_products_from_period(
                 tenant_id=tenant.id,
                 date_from=date_from,
-                date_to=date_to
+                date_to=date_to,
+                api_key=tenant.wb_api_key
             )
             
             logger.info(f"✅ Product sync completed: {products_stats}")
@@ -132,6 +146,32 @@ class SyncService:
         except Exception as e:
             logger.error(f"❌ Product sync failed: {str(e)}")
             return {'created': 0, 'skipped': 0, 'total_processed': 0}
+
+    async def _sync_product_stocks(
+        self,
+        db: Session,
+        tenant: Tenant,
+        week_start: date
+    ) -> Dict[str, int]:
+        """Синхронизация остатков на складах WB (product_stock_monthly)"""
+
+        logger.info(f"🔄 Starting stock sync for tenant {tenant.id}")
+
+        try:
+            stock_sync_service = StockSyncService(db)
+
+            stats = await stock_sync_service.sync_tenant_stocks(
+                tenant_id=tenant.id,
+                api_key=tenant.wb_api_key,
+                week_start=week_start
+            )
+
+            logger.info(f"✅ Stock sync completed: {stats}")
+            return stats
+
+        except Exception as e:
+            logger.error(f"❌ Stock sync failed: {str(e)}")
+            return {'products_processed': 0, 'products_updated': 0}
     
     async def _process_single_batch(
         self,

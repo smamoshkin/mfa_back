@@ -139,6 +139,14 @@ marketfinanceapp/
 - UNIQUE: `(tenant_id, start_date, end_date)`
 - Индексы: `ix_tax_rates_id`, `ix_tax_rates_tenant_id`, `ix_tax_rates_date_range`
 
+### ProductStockMonthly (`product_stock_monthly`) — Остатки на складах WB (помесячно)
+- `id`, `tenant_id` (FK → tenants, CASCADE DELETE), `sku` (артикул продавца), `nm_id` (nmId WB, для трассируемости)
+- `period_month` (первое число месяца), `quantity` (сумма остатка по всем складам WB на момент синка), `updated_at`
+- UNIQUE: `(tenant_id, sku, period_month)`
+- Используется для расчёта оборачиваемости (`turnover_days`) в `/analytics/rentability` и в будущем ABC-анализе
+- **Логика заполнения (важно):** данные приходят из WB как "текущий остаток на сейчас", истории по датам WB не отдаёт. Строка на месяц обновляется еженедельно (апсерт поверх той же строки) и "замораживается" сама по себе, когда начинается следующий месяц — специальной логики закрытия периода не требуется. Если синхронизируемая неделя пересекла границу месяцев (целиком или частично — см. `StockSyncService._target_periods`), снапшот дублируется в оба месяца: в закрывающийся месяц он становится финальным известным значением, в новый — первым из нескольких будущих обновлений
+- DDL лежит в `db/tables/product_stock_monthly.sql`, но **применяется вручную** — таблица намеренно не включена в список `create_all()` в `main.py` (см. тот же паттерн, что и у `tax_rates`)
+
 ### Database Views (представления в БД)
 Полные DDL находятся в папке `db/views/`.
 
@@ -173,7 +181,7 @@ marketfinanceapp/
 ### Товары (`/products`)
 | Метод | Путь | Описание |
 |-------|------|----------|
-| POST | `/products/` | Создать товар (tenant_id ставится автоматически) |
+| POST | `/products/` | Создать товар (tenant_id ставится автоматически из токена, в теле запроса не нужен и не принимается схемой; обязательны только `sku` и `marketplace_sku`) |
 | GET | `/products/` | Список товаров текущего тенанта |
 | GET | `/products/{id}` | Получить товар по ID |
 | PUT | `/products/{id}` | Обновить товар |
@@ -224,7 +232,7 @@ marketfinanceapp/
 ### Аналитика (`/analytics`)
 | Метод | Путь | Описание |
 |-------|------|----------|
-| GET | `/analytics/rentability` | Отчёт рентабельности/прибыльности |
+| GET | `/analytics/rentability` | Отчёт рентабельности/прибыльности. Каждый товар в `products[]` дополнительно содержит `turnover_days` — оборачиваемость (дни запаса), см. `AnalyticsService` |
 | GET | `/analytics/financial-overview` | Финансовый обзор (заглушка) |
 | POST | `/analytics/export/excel` | Экспорт аналитики в Excel с формулами |
 
@@ -291,7 +299,8 @@ marketfinanceapp/
 - Универсальная Celery-задача для синхронизации данных WB
 - Параметры: `tenant_id`, `date_from`, `date_to`
 - Отслеживание прогресса через `update_state()` (PROGRESS → SUCCESS/FAILURE)
-- Возвращает метрики: total_time, total_records, api_calls, batches_processed, products_synced
+- Возвращает метрики: total_time, total_records, api_calls, batches_processed, products_synced, stocks_updated
+- После синка отчётов и продуктов дополнительно синхронизирует остатки на складах WB (`SyncService._sync_product_stocks` → `StockSyncService`) — независимо от того, были ли новые продажи за период, при условии что у тенанта есть `wb_api_key`
 
 ### Задача: `weekly_sync_all_tenants`
 - Запланированная еженедельная синхронизация ВСЕХ активных тенантов с WB API ключами
@@ -306,15 +315,16 @@ marketfinanceapp/
 ### WBAPIClient (`wb_api_client.py`)
 - Асинхронный HTTP-клиент для API Wildberries
 - **Финансовый API:** `https://statistics-api.wildberries.ru/api/v5/supplier/reportDetailByPeriod`
-- **Content API:** `https://content-api.wildberries.ru/content/v2/get/cards/list`
+- **Content API:** `https://content-api.wildberries.ru/content/v2/get/cards/list` (POST, карточка товара по артикулу — название, описание, фото)
+- **Seller Analytics API:** `https://seller-analytics-api.wildberries.ru/api/analytics/v1/stocks-report/wb-warehouses` (POST, остатки на складах по списку `nmId`) — метод `get_stocks_report`
 - SSL-верификация через certifi
-- Обработка rate limiting (429), ошибок аутентификации (401)
+- Обработка rate limiting (429), ошибок аутентификации (401), ретраи с ожиданием 65с
 
 ### SyncService (`sync_service.py`)
 - Оркеструет полную синхронизацию данных WB
 - **Пагинация:** загружает данные батчами по 100k записей через курсор `rrd_id`
 - **65-секундная задержка** между вызовами API (соблюдение rate limit)
-- Двухэтапный процесс: (1) синхронизация отчётов, (2) синхронизация/обогащение товаров
+- Этапы: (1) синхронизация отчётов, (2) синхронизация продуктов + фото нового товара, (3) синхронизация остатков на складах (`_sync_product_stocks` → `StockSyncService`, шаг 3 не зависит от того, были ли новые записи в отчётах за период)
 - Пакетная вставка в БД с подробными метриками времени
 
 ### ReportMapperService (`report_mapper.py`)
@@ -326,7 +336,14 @@ marketfinanceapp/
 ### ProductSyncService (`product_sync_service.py`)
 - Извлекает уникальные товары из отчётов поставщика (SQL window function по SKU)
 - Создаёт товары в БД, если они ещё не существуют
-- Обогащает товары через WB Content API (название, описание, фото)
+- **Фото нового товара:** сразу после создания нового товара (`sync_products_from_period`) дёргает `fetch_product_photo()` — запрос в WB Content API по `sku` (`withPhoto=1, limit=1`), берёт `photos[0].square` и сохраняет в `products.foto`. Для уже существующих товаров повторно не запрашивается (чтобы не дёргать WB API на каждый синк)
+- Если карточки/фото нет в ответе WB — не ошибка, просто ничего не сохраняется
+
+### StockSyncService (`stock_sync_service.py`)
+- Синхронизирует остатки на складах WB → таблица `product_stock_monthly`
+- Берёт список `nmId` из уже существующих товаров тенанта (`products.marketplace_sku`), одним batch-запросом получает остатки через `WBAPIClient.get_stocks_report`, суммирует `quantity` по всем складам на каждый `nmId`
+- `_target_periods(week_start, today)` — определяет, в какие `period_month` писать снапшот: обычно только текущий месяц; если синхронизируемая неделя недавно (≤10 дней) пересекла границу месяцев — дублирует и в закрывающийся месяц (там значение становится финальным для того месяца). Защищено от долгих initial/manual-синков с далёким `date_from`
+- Апсерт через `INSERT ... ON CONFLICT (tenant_id, sku, period_month) DO UPDATE`
 
 ### AnalyticsService (`analytics_service.py`)
 - Генерирует отчёты рентабельности/прибыльности
@@ -337,6 +354,9 @@ marketfinanceapp/
   - Премия: 5% от (маржа − расходы − (удержания − выручка×10%))
   - Маржа владельца: 10% от (маржа − расходы)
 - Итоговая рентабельность = (маржа_после_зарплаты / выплаты) × 100
+- **Оборачиваемость (`turnover_days`, по товару в `products[]`):** `остаток_на_складе ÷ среднедневные_продажи_за_период` (DSI, дни запаса), остаток — из `product_stock_monthly`. Если продаж за период не было, но остаток есть → `9999.0` (условная "бесконечность", не `Infinity`/`NaN`, чтобы сериализовалось в JSON); если и продаж, и остатка нет → `0.0`. Отрицательный остаток клампится в `0`. Округление — на фронте, бэк отдаёт дробное число
+  - **`days_in_period` считается НЕ как `date_to − date_from` из фильтра фронта, а от `date_from` до последней реально засинканной даты продаж** (`_get_last_synced_date()` — `MAX(period_day)` из `SupplierReportsAggregatedV` в границах периода). Причина: синк идёт еженедельно, поэтому в начале ещё не закончившегося месяца (например, если сегодня 8-е число и засинкана только первая неделя) `date_to` фильтра — это конец месяца, а реальных данных о продажах в разы меньше. Без этой поправки среднедневные продажи занижаются, а `turnover_days` завышается в разы (пример: продали 10 шт. за первые 7 дней, на складе 100 → без поправки `100÷(10÷30)=300` дней, с поправкой `100÷(10÷7)=70` дней — корректно). Для уже завершившегося и полностью засинканного месяца формула не требует отдельной ветки: `MAX(period_day)` сам естественным образом совпадёт с последним днём месяца
+  - **Ещё один нюанс:** `period_month` во `ProductMarginsMonthV` (и `period_day` в `SupplierReportsAggregatedV`) физически приходит как `timestamp with time zone` (результат `date_trunc()` в самой view), а не `date`, хотя ORM-модель объявляет колонку как `Date`. Перед использованием как ключа словаря/фильтра по `product_stock_monthly.period_month` (настоящий `date`) он нормализуется через `AnalyticsService._as_date()` — иначе `(sku, period_month)` как ключ словаря никогда не совпадёт (`hash(datetime) != hash(date)`)
 
 ### DynamicReport (`report_generator.py`)
 - Генератор Excel-отчётов со встроенными формулами
@@ -418,6 +438,11 @@ celery -A app.celery_app.celery_app flower
 ### Многотенантность
 - Все данные привязаны к `tenant_id`
 - CRUD слои фильтруют по `tenant_id` текущего авторизованной сессии
+
+### Новые таблицы и DDL
+- DDL для новых таблиц пишется в `db/tables/*.sql` (в стиле существующих файлов), но **применяется в БД вручную** — так принято в проекте (см. `tax_rates`, `product_stock_monthly`)
+- Такие таблицы намеренно не добавляются в явный список импорта моделей в `main.py` (строка с `create_all()`) — по той же причине
+- Модель всё равно должна быть зарегистрирована в `app/models/__init__.py`, чтобы её можно было импортировать и использовать в коде
 
 ### Дата-диапазоны
 - `ProductCost` и `TaxRate` используют исторический подход: `start_date` + `end_date` (nullable = текущая запись)

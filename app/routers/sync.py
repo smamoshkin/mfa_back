@@ -8,6 +8,7 @@ from typing import Optional
 from app.database.database import get_db
 from app.models.tenant import Tenant
 from app.services.sync_service import SyncService
+from app.services.stock_sync_service import StockSyncService
 from app.services.sync_orchestrator import sync_orchestrator
 from app.routers.auth import get_current_tenant
 from app.tasks.sync_tasks import sync_tenant_wb_data
@@ -109,6 +110,51 @@ async def sync_wb_data_background(
         sync_type="manual",
         message="Sync started as background task." if job else f"Failed: {error}",
     )
+
+
+@router.post("/wb/{tenant_id}/stocks")
+async def sync_wb_stocks_now(
+    tenant_id: int,
+    current_tenant=Depends(get_current_tenant),
+    db: Session = Depends(get_db),
+):
+    """
+    Технический эндпоинт: разово подгрузить текущие остатки на складах WB,
+    не дожидаясь еженедельной синхронизации. Выполняется синхронно (без
+    Celery) и сразу возвращает результат.
+
+    Пишет снапшот только в текущий месяц (week_start = today) — без логики
+    дублирования в закрывающийся месяц, т.к. это не привязано к какой-либо
+    неделе отчётов, а просто "загрузить остатки, какие они есть сейчас".
+    """
+    if current_tenant.id != tenant_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cannot sync data for another tenant",
+        )
+
+    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    if not tenant:
+        raise HTTPException(404, "Tenant not found")
+    if not tenant.wb_api_key:
+        raise HTTPException(400, "WB API Key not configured for this tenant")
+
+    stock_sync_service = StockSyncService(db)
+
+    today = date.today()
+    stats = await stock_sync_service.sync_tenant_stocks(
+        tenant_id=tenant.id,
+        api_key=tenant.wb_api_key,
+        week_start=today,
+        today=today,
+    )
+
+    return {
+        "status": "completed",
+        "tenant_id": tenant_id,
+        "period_month": today.replace(day=1).isoformat(),
+        **stats,
+    }
 
 
 @router.get("/task/{task_id}/status")

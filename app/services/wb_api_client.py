@@ -15,7 +15,8 @@ class WBAPIClient:
     def __init__(self):
         self.fin_base_url = "https://finance-api.wildberries.ru/api/finance/v1"  #"https://statistics-api.wildberries.ru/api/v5/supplier"
         self.content_base_url = "https://content-api.wildberries.ru/content/v2"
-        
+        self.analytics_base_url = "https://seller-analytics-api.wildberries.ru/api"
+
     async def get_report_detail_by_period(
         self,
         api_key: str,
@@ -84,14 +85,15 @@ class WBAPIClient:
         raise Exception("Unexpected end of retry loop")
 
     async def get_product_data_by_sku(
-        self, 
+        self,
         api_key: str,
         sku: str,
-        limit: int = 100
+        limit: int = 100,
+        with_photo: int = -1
     ) -> List[Dict[str, Any]]:
-        
+
         headers = {
-            "Authorization": f"Bearer {api_key}",
+            "Authorization": api_key,
             "Content-Type": "application/json"
         }
 
@@ -102,23 +104,23 @@ class WBAPIClient:
                             },
                             "filter": {
                                 "textSearch": sku,
-                                "withPhoto": -1
+                                "withPhoto": with_photo
                             }
                         }
                     }
-        
+
         ssl_context = ssl.create_default_context(cafile=certifi.where())
         connector = aiohttp.TCPConnector(ssl=ssl_context)
-        
+
         try:
             async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.get(
+                async with session.post(
                     f"{self.content_base_url}/get/cards/list",
                     headers=headers,
                     json=payload,
                     timeout=aiohttp.ClientTimeout(total=61)
                 ) as response:
-                    
+
                     if response.status == 200:
                             data = await response.json()
                             card = data.get("cards", [])
@@ -133,4 +135,71 @@ class WBAPIClient:
         except Exception as e:
             logger.error(f"WB API request failed: {str(e)}")
             raise
-            
+
+    async def get_stocks_report(
+        self,
+        api_key: str,
+        nm_ids: List[int],
+        limit: int = 250000,
+        offset: int = 0,
+        max_retries: int = 3,
+    ) -> List[Dict[str, Any]]:
+        """
+        ОДИН запрос к WB Seller Analytics API — остатки на складах WB по списку nmId.
+        При 429 — ждёт 65 секунд и повторяет (до max_retries раз).
+        """
+        headers = {
+            "Authorization": api_key,
+            "Content-Type": "application/json"
+        }
+        body = {
+            "nmIds": nm_ids,
+            "limit": limit,
+            "offset": offset,
+        }
+
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+
+        for attempt in range(1, max_retries + 1):
+            connector = aiohttp.TCPConnector(ssl=ssl_context)
+            try:
+                async with aiohttp.ClientSession(connector=connector) as session:
+                    async with session.post(
+                        f"{self.analytics_base_url}/analytics/v1/stocks-report/wb-warehouses",
+                        headers=headers,
+                        json=body,
+                        timeout=aiohttp.ClientTimeout(total=65),
+                    ) as response:
+
+                        if response.status == 200:
+                            data = await response.json()
+                            items = data.get("data", {}).get("items", [])
+                            logger.info(f"📥 Received {len(items)} stock rows for {len(nm_ids)} nmIds")
+                            return items
+
+                        elif response.status == 401:
+                            raise Exception("Invalid API Key")
+
+                        elif response.status == 429:
+                            if attempt < max_retries:
+                                logger.warning(
+                                    f"⏳ Rate limit hit on stocks-report (attempt {attempt}/{max_retries}), "
+                                    f"waiting {RATE_LIMIT_WAIT}s..."
+                                )
+                                await asyncio.sleep(RATE_LIMIT_WAIT)
+                                continue
+                            else:
+                                raise Exception(
+                                    f"Rate limit exceeded after {max_retries} retries"
+                                )
+
+                        else:
+                            error_text = await response.text()
+                            raise Exception(f"WB API error {response.status}: {error_text}")
+
+            except Exception as e:
+                if "Rate limit" not in str(e) or attempt >= max_retries:
+                    logger.error(f"WB stocks-report request failed (attempt {attempt}): {str(e)}")
+                    raise
+
+        raise Exception("Unexpected end of retry loop")

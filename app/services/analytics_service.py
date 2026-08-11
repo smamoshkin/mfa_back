@@ -1,10 +1,17 @@
 # app/services/analytics_service.py (исправленная версия)
 from sqlalchemy.orm import Session
-from datetime import date
+from sqlalchemy import func
+from datetime import date, datetime
 from typing import Dict, List, Any, Optional
 import logging
 from decimal import Decimal
 from app.models.analytics_views import SupplierReportsAggregatedV, ProductMarginsMonthV
+from app.models.product_stock import ProductStockMonthly
+
+# Сколько дней запаса считать "бесконечной" оборачиваемостью (товар не продавался
+# за период вообще) — не Infinity/NaN, чтобы значение нормально сериализовалось в JSON,
+# но заведомо больше порога "C" (>60 дней) на фронте.
+NO_SALES_TURNOVER_DAYS = 9999.0
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +33,6 @@ class AnalyticsService:
         try:
             # 1. Получаем агрегированные данные из VIEW БД
             base_data = self._get_aggregated_data(tenant_id, date_from, date_to, group_by)
-            
             if not base_data:
                 return self._get_empty_rent_report(date_from, date_to)
             
@@ -35,9 +41,20 @@ class AnalyticsService:
             
             # 3. Сложные расчеты рентабельности в Python
             rent_calculations = self._calculate_rentability(totals)
-            
-            # 4. Детализация по товарам
-            product_details = self._get_product_details(base_data)
+
+            # 4. Остатки по товарам за период (для расчета оборачиваемости)
+            stock_by_sku_period = self._get_stock_map(tenant_id, base_data)
+
+            # Синк идёт еженедельно, поэтому текущий (ещё не закончившийся) месяц
+            # обычно покрыт продажами не полностью — считаем среднедневные продажи
+            # не на весь запрошенный диапазон, а на реально засинканные дни, иначе
+            # оборачиваемость будет завышена в разы в начале месяца.
+            last_synced_date = self._get_last_synced_date(tenant_id, date_from, date_to)
+            effective_date_to = last_synced_date or date_from
+            days_in_period = max((effective_date_to - date_from).days + 1, 1)
+
+            # 5. Детализация по товарам
+            product_details = self._get_product_details(base_data, days_in_period, stock_by_sku_period)
             
             return {
                 "period": {
@@ -70,7 +87,28 @@ class AnalyticsService:
             period_column >= date_from,
             period_column <= date_to
         ).all()
-    
+
+    def _get_last_synced_date(
+        self,
+        tenant_id: int,
+        date_from: date,
+        date_to: date
+    ) -> Optional[date]:
+        """
+        Последний день внутри запрошенного периода, за который реально есть
+        синхронизированные продажи. Синк идёт еженедельно, поэтому для текущего
+        (ещё не закончившегося) месяца это почти всегда раньше, чем date_to —
+        например, если сегодня 8-е число, а неделя синкается по понедельникам,
+        реально засинканы только первые 7 дней месяца, а не всё до date_to.
+        """
+        last_day = self.db.query(func.max(SupplierReportsAggregatedV.period_day)).filter(
+            SupplierReportsAggregatedV.tenant_id == tenant_id,
+            SupplierReportsAggregatedV.period_day >= date_from,
+            SupplierReportsAggregatedV.period_day <= date_to
+        ).scalar()
+
+        return self._as_date(last_day) if last_day else None
+
     def _calculate_totals(self, data: List[ProductMarginsMonthV]) -> Dict[str, Any]:
         """Агрегация итогов из данных VIEW"""
         # 👇 Используем функцию для конвертации Decimal в float
@@ -183,7 +221,43 @@ class AnalyticsService:
             "total_logistics": float(totals["total_delivery_rub"] + totals["total_acceptance"])
         }
     
-    def _get_product_details(self, data: List[ProductMarginsMonthV]) -> List[Dict[str, Any]]:
+    @staticmethod
+    def _as_date(value):
+        """
+        product_margins_month_v.period_month приходит из date_trunc() над
+        timestamptz, поэтому реально возвращается datetime (с таймзоной), а не
+        date — даже несмотря на то что ORM-модель объявляет колонку как Date.
+        product_stock_monthly.period_month — настоящий date. Без этой нормализации
+        (sku, period_month) как ключ словаря никогда не совпадёт между ними,
+        т.к. hash(datetime) != hash(date), даже если дата одна и та же.
+        """
+        if isinstance(value, datetime):
+            return value.date()
+        return value
+
+    def _get_stock_map(
+        self,
+        tenant_id: int,
+        data: List[ProductMarginsMonthV]
+    ) -> Dict[Any, int]:
+        """Остатки на складах WB по (sku, period_month) для строк отчета"""
+        periods = {self._as_date(d.period_month) for d in data if d.period_month is not None}
+        if not periods:
+            return {}
+
+        rows = self.db.query(ProductStockMonthly).filter(
+            ProductStockMonthly.tenant_id == tenant_id,
+            ProductStockMonthly.period_month.in_(periods)
+        ).all()
+
+        return {(r.sku, r.period_month): r.quantity for r in rows}
+
+    def _get_product_details(
+        self,
+        data: List[ProductMarginsMonthV],
+        days_in_period: int,
+        stock_by_sku_period: Dict[Any, int]
+    ) -> List[Dict[str, Any]]:
         """Детализация по товарам для отчета"""
         def _safe_float(value):
             if value is None:
@@ -191,9 +265,23 @@ class AnalyticsService:
             if isinstance(value, Decimal):
                 return float(value)
             return float(value)
-        
-        return [
-            {
+
+        result = []
+        for d in data:
+            quantity_sold = d.quantity_sold or 0
+            avg_daily_sales = quantity_sold / days_in_period
+
+            # Отрицательный остаток — ошибка учета, в API не пропускаем
+            period_month = self._as_date(d.period_month)
+            stock_quantity = max(stock_by_sku_period.get((d.sku, period_month), 0), 0)
+            if avg_daily_sales <= 0:
+                # Продаж за период не было — товар не оборачивается вообще
+                # ("мёртвый" запас), но не 0 остатка — не путаем эти два случая
+                turnover_days = NO_SALES_TURNOVER_DAYS if stock_quantity > 0 else 0.0
+            else:
+                turnover_days = stock_quantity / avg_daily_sales
+
+            result.append({
                 "sku": d.sku,
                 "product_name": d.product_name,
                 "quantity_sold": d.quantity_sold,
@@ -201,10 +289,11 @@ class AnalyticsService:
                 "margin": _safe_float(d.margin),
                 "margin_percent": _safe_float(d.margin_percent_revenue),
                 "margin_per_unit": _safe_float(d.margin_per_unit),
-                "logistics_per_unit": _safe_float(d.logistics_per_unit)
-            }
-            for d in data
-        ]
+                "logistics_per_unit": _safe_float(d.logistics_per_unit),
+                "turnover_days": float(turnover_days)
+            })
+
+        return result
     
     def _generate_summary(self, totals: Dict, rentability: Dict) -> Dict[str, Any]:
         """Генерируем текстовую сводку отчета"""
