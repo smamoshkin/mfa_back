@@ -4,6 +4,8 @@ import asyncio
 from datetime import date
 from typing import Dict
 from sqlalchemy.orm import Session
+from sqlalchemy import text
+from app.database.database import engine
 from app.services.wb_api_client import WBAPIClient
 from app.services.report_mapper import ReportMapperService
 from app.services.product_sync_service import ProductSyncService  # 👈 Добавляем
@@ -38,7 +40,8 @@ class SyncService:
             'batches_processed': 0,
             'last_rrdid': 0,
             'products_synced': 0,  # 👈 Добавляем метрику для продуктов
-            'stocks_updated': 0
+            'stocks_updated': 0,
+            'mv_refresh_ms': 0     # Время REFRESH мат.view аналитики (0 = не выполнялся)
         }
         
         start_time = time.time()
@@ -97,6 +100,14 @@ class SyncService:
                     week_start=date_from
                 )
                 metrics['stocks_updated'] = stock_metrics['products_updated']
+
+            # ШАГ ОБНОВЛЕНИЯ МАТ.VIEW АНАЛИТИКИ — фоновый пересчёт кеша отчётов.
+            # Весь синк идёт в Celery-задаче (не в HTTP-транзакции), поэтому
+            # безопасно сделать REFRESH CONCURRENTLY через отдельное autocommit-
+            # соединение. Ошибки рефреша НЕ должны валить синк: сырые данные уже
+            # сохранены, просто отчёт будет строиться по старому снапшоту до
+            # следующего успешного рефреша.
+            metrics['mv_refresh_ms'] = self._refresh_analytics_materialized_views()
 
             metrics['total_time'] = time.time() - start_time
 
@@ -172,7 +183,44 @@ class SyncService:
         except Exception as e:
             logger.error(f"❌ Stock sync failed: {str(e)}")
             return {'products_processed': 0, 'products_updated': 0}
-    
+
+    def _refresh_analytics_materialized_views(self) -> int:
+        """
+        REFRESH MATERIALIZED VIEW CONCURRENTLY для обеих мат.view аналитики.
+
+        CONCURRENTLY нельзя выполнить внутри транзакции, а основная сессия
+        синка работает с autocommit=False — поэтому открываем отдельное
+        соединение в режиме AUTOCOMMIT и выполняем оба рефреша в нём.
+
+        Порядок важен: сначала supplier_reports_agg_mv (подневная), затем
+        product_margins_mv (читает из первой).
+
+        Возвращает время рефреша в мс. Любая ошибка логируется на warning,
+        но НЕ пробрасывается: рефреш — это фоновое обновление кеша отчётов;
+        его провал не должен валить синк (сырые данные уже сохранены,
+        отчёт просто останется на предыдущем снапшоте до след. синка).
+        """
+        refresh_sql = [
+            "REFRESH MATERIALIZED VIEW CONCURRENTLY supplier_reports_agg_mv",
+            "REFRESH MATERIALIZED VIEW CONCURRENTLY product_margins_mv",
+        ]
+        start = time.time()
+        try:
+            # Отдельное соединение с autocommit — обязательно для CONCURRENTLY.
+            with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+                for stmt in refresh_sql:
+                    conn.execute(text(stmt))
+            elapsed_ms = int((time.time() - start) * 1000)
+            logger.info(f"✅ Materialized views refreshed (CONCURRENTLY) in {elapsed_ms}ms")
+            return elapsed_ms
+        except Exception as e:
+            elapsed_ms = int((time.time() - start) * 1000)
+            logger.warning(
+                f"⚠️ Materialized view refresh failed after {elapsed_ms}ms: {e}. "
+                f"Analytics will use previous snapshot until next sync."
+            )
+            return elapsed_ms
+
     async def _process_single_batch(
         self,
         db: Session,

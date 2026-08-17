@@ -5,7 +5,12 @@ from datetime import date, datetime
 from typing import Dict, List, Any, Optional
 import logging
 from decimal import Decimal
-from app.models.analytics_views import SupplierReportsAggregatedV, ProductMarginsMonthV
+from app.models.analytics_views import (
+    SupplierReportsAggregatedV,
+    ProductMarginsMonthV,
+    SupplierReportsAggMV,
+    ProductMarginsMV,
+)
 from app.models.product_stock import ProductStockMonthly
 
 # Сколько дней запаса считать "бесконечной" оборачиваемостью (товар не продавался
@@ -73,17 +78,25 @@ class AnalyticsService:
             raise
     
     def _get_aggregated_data(
-        self, 
-        tenant_id: int, 
-        date_from: date, 
-        date_to: date, 
+        self,
+        tenant_id: int,
+        date_from: date,
+        date_to: date,
         group_by: str
-    ) -> List[ProductMarginsMonthV]:
-        """Получаем данные из VIEW с фильтрацией по периоду"""
-        period_column = getattr(ProductMarginsMonthV, f"period_{group_by}")
-        
-        return self.db.query(ProductMarginsMonthV).filter(
-            ProductMarginsMonthV.tenant_id == tenant_id,
+    ) -> List[ProductMarginsMV]:
+        """
+        Получаем данные из MATERIALIZED VIEW с фильтрацией по периоду.
+
+        Источник — product_margins_mv (мат.view), а не product_margins_month_v
+        (обычная view). Разница: мат.view хранит посчитанный результат и читается
+        за единицы мс, обычная — каждый раз пересчитывает агрегаты по всем
+        supplier_reports (~секунды). Логика расчётов идентична (CASE для
+        period_month сохранён), см. db/materialized_views/.
+        """
+        period_column = getattr(ProductMarginsMV, f"period_{group_by}")
+
+        return self.db.query(ProductMarginsMV).filter(
+            ProductMarginsMV.tenant_id == tenant_id,
             period_column >= date_from,
             period_column <= date_to
         ).all()
@@ -101,15 +114,15 @@ class AnalyticsService:
         например, если сегодня 8-е число, а неделя синкается по понедельникам,
         реально засинканы только первые 7 дней месяца, а не всё до date_to.
         """
-        last_day = self.db.query(func.max(SupplierReportsAggregatedV.period_day)).filter(
-            SupplierReportsAggregatedV.tenant_id == tenant_id,
-            SupplierReportsAggregatedV.period_day >= date_from,
-            SupplierReportsAggregatedV.period_day <= date_to
+        last_day = self.db.query(func.max(SupplierReportsAggMV.period_day)).filter(
+            SupplierReportsAggMV.tenant_id == tenant_id,
+            SupplierReportsAggMV.period_day >= date_from,
+            SupplierReportsAggMV.period_day <= date_to
         ).scalar()
 
         return self._as_date(last_day) if last_day else None
 
-    def _calculate_totals(self, data: List[ProductMarginsMonthV]) -> Dict[str, Any]:
+    def _calculate_totals(self, data: List[ProductMarginsMV]) -> Dict[str, Any]:
         """Агрегация итогов из данных VIEW"""
         # 👇 Используем функцию для конвертации Decimal в float
         def _to_float(value):
@@ -238,7 +251,7 @@ class AnalyticsService:
     def _get_stock_map(
         self,
         tenant_id: int,
-        data: List[ProductMarginsMonthV]
+        data: List[ProductMarginsMV]
     ) -> Dict[Any, int]:
         """Остатки на складах WB по (sku, period_month) для строк отчета"""
         periods = {self._as_date(d.period_month) for d in data if d.period_month is not None}
@@ -254,7 +267,7 @@ class AnalyticsService:
 
     def _get_product_details(
         self,
-        data: List[ProductMarginsMonthV],
+        data: List[ProductMarginsMV],
         days_in_period: int,
         stock_by_sku_period: Dict[Any, int]
     ) -> List[Dict[str, Any]]:

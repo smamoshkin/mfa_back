@@ -27,7 +27,81 @@ class SupplierReportsAggregatedV(Base):
 
 class ProductMarginsMonthV(Base):
     __tablename__ = 'product_margins_month_v'
-    
+
+    tenant_id = Column(Integer, primary_key=True)
+    period_month = Column(Date)
+    product_name = Column(String)
+    sku = Column(String, primary_key=True)
+    quantity_sold = Column(Integer)
+    revenue = Column(Numeric(10, 2))
+    seller_payout = Column(Numeric(10, 2))
+    retail_price_max = Column(Numeric(10, 2))
+    tax = Column(Numeric(10, 2))
+    payout_after_tax = Column(Numeric(10, 2))
+    cost_per_unit = Column(Numeric(10, 2))
+    total_cost = Column(Numeric(10, 2))
+    storage_fee = Column(Numeric(10, 2))
+    regular_deduction = Column(Numeric(10, 2))
+    dzhem_deduction = Column(Numeric(10, 2))
+    delivery_rub = Column(Numeric(10, 2))
+    penalty = Column(Numeric(10, 2))
+    acceptance = Column(Numeric(10, 2))
+    return_quantity = Column(Integer)
+    return_revenue = Column(Numeric(10, 2))
+    margin = Column(Numeric(10, 2))
+    margin_percent_revenue = Column(Numeric(10, 2))
+    margin_percent_payout = Column(Numeric(10, 2))
+    logistics_per_unit = Column(Numeric(10, 2))
+    margin_per_unit = Column(Numeric(10, 2))
+
+
+# ----------------------------------------------------------------------------
+# Материализованные view — на них переключено чтение аналитики (AnalyticsService).
+# Логика расчётов та же, что и у обычных view выше (CASE для period_month сохранён),
+# см. db/materialized_views/.
+#
+# В __init__.py и create_all() намеренно НЕ добавляются — по конвенции проекта
+# view/мат.view применяются в БД вручную (как tax_rates, product_stock_monthly).
+# ----------------------------------------------------------------------------
+
+class SupplierReportsAggMV(Base):
+    """Мат.view supplier_reports_agg_mv — подневная агрегация (аналог SupplierReportsAggregatedV)."""
+    __tablename__ = 'supplier_reports_agg_mv'
+
+    tenant_id = Column(Integer, primary_key=True)
+    period_day = Column(Date, primary_key=True)
+    period_week = Column(Date)
+    period_month = Column(Date, primary_key=True)
+    period_quarter = Column(Date)
+    period_year = Column(Date)
+    product_name = Column(String)
+    sku = Column(String, primary_key=True)
+    quantity_sold = Column(Integer)
+    revenue = Column(Numeric(10, 2))
+    seller_payout = Column(Numeric(10, 2))
+    retail_price_max = Column(Numeric(10, 2))
+    storage_fee = Column(Numeric(10, 2))
+    regular_deduction = Column(Numeric(10, 2))
+    dzhem_deduction = Column(Numeric(10, 2))
+    delivery_rub = Column(Numeric(10, 2))
+    penalty = Column(Numeric(10, 2))
+    acceptance = Column(Numeric(10, 2))
+    return_quantity = Column(Integer)
+    return_revenue = Column(Numeric(10, 2))
+    # Колонки ниже есть в мат.view supplier_reports_agg_mv, но отсутствуют
+    # в обычной SupplierReportsAggregatedV — они перенесены сюда из DDL,
+    # т.к. помесячная product_margins_mv суммирует по ним.
+    tax = Column(Numeric(10, 2))
+    payout_after_tax = Column(Numeric(10, 2))
+    cost_per_unit = Column(Numeric(10, 2))
+    total_cost = Column(Numeric(10, 2))
+    margin = Column(Numeric(10, 2))
+
+
+class ProductMarginsMV(Base):
+    """Мат.view product_margins_mv — помесячная маржа (аналог ProductMarginsMonthV)."""
+    __tablename__ = 'product_margins_mv'
+
     tenant_id = Column(Integer, primary_key=True)
     period_month = Column(Date)
     product_name = Column(String)

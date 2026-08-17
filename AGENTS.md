@@ -399,6 +399,35 @@ celery -A app.celery_app.celery_app worker --loglevel=info -Q wb_sync
 celery -A app.celery_app.celery_app flower
 ```
 
+### Развёртывание на проде (Docker, команды владельца проекта)
+
+В проде код запечён в образ (не примонтирован volumes), поэтому простой
+`docker restart` поднимает старый код — нужен rebuild. Владелец проекта
+перезапускает прод **только так**:
+
+```bash
+# Если нужно исключить Docker cache
+docker compose build --no-cache backend celery_worker celery_beat
+docker compose up -d --force-recreate backend celery_worker celery_beat
+```
+
+PostgreSQL и Redis эти команды не пересоздают и не трогают.
+
+Проверка после запуска:
+```bash
+docker compose ps
+docker compose logs --tail=50 backend
+docker compose logs --tail=50 celery_worker
+docker compose logs --tail=50 celery_beat
+```
+
+Если в релиз входят изменения DDL (например, `db/materialized_views/*.sql`) —
+сначала применить их к прод-БД, потом rebuild:
+```bash
+docker compose exec -T db psql -U marketfinance_user -d marketfinance_db < db/materialized_views/01_create_supplier_reports_agg_mv.sql
+docker compose exec -T db psql -U marketfinance_user -d marketfinance_db < db/materialized_views/02_create_product_margins_mv.sql
+```
+
 ---
 
 ## Известные проблемы и технические долги
