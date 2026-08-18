@@ -30,7 +30,7 @@ def create_product(
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Product with this SKU or marketplace SKU already exists"
+            detail="Product with this SKU already exists"
         )
     except Exception as e:
         db.rollback()
@@ -96,7 +96,7 @@ def update_product(
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Product with this SKU or marketplace SKU already exists"
+            detail="Product with this SKU already exists"
         )
 
 @router.delete("/{product_id}")

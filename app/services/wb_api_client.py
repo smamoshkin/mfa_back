@@ -89,8 +89,18 @@ class WBAPIClient:
         api_key: str,
         sku: str,
         limit: int = 100,
-        with_photo: int = -1
+        with_photo: int = -1,
+        max_retries: int = 3
     ) -> List[Dict[str, Any]]:
+        """
+        Карточки товара из WB Content API (POST /get/cards/list).
+        При 429 — ждёт 65 секунд и повторяет (до max_retries раз), по аналогии
+        с финансовым API и stocks-report.
+
+        Ретраи здесь критичны: фото запрашивается только при создании товара,
+        и без ретраев один-единственный 429 означал, что фото этого товара
+        не будет загружено никогда (повторного запроса для существующих нет).
+        """
 
         headers = {
             "Authorization": api_key,
@@ -110,31 +120,48 @@ class WBAPIClient:
                     }
 
         ssl_context = ssl.create_default_context(cafile=certifi.where())
-        connector = aiohttp.TCPConnector(ssl=ssl_context)
 
-        try:
-            async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.post(
-                    f"{self.content_base_url}/get/cards/list",
-                    headers=headers,
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=61)
-                ) as response:
+        for attempt in range(1, max_retries + 1):
+            connector = aiohttp.TCPConnector(ssl=ssl_context)
+            try:
+                async with aiohttp.ClientSession(connector=connector) as session:
+                    async with session.post(
+                        f"{self.content_base_url}/get/cards/list",
+                        headers=headers,
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=61)
+                    ) as response:
 
-                    if response.status == 200:
+                        if response.status == 200:
                             data = await response.json()
-                            card = data.get("cards", [])
-                            return card
-                    elif response.status == 401:
-                        raise Exception("Invalid API Key")
-                    elif response.status == 429:
-                        raise Exception("Rate limit exceeded")
-                    else:
-                        error_text = await response.text()
-                        raise Exception(f"WB API error {response.status}: {error_text}")
-        except Exception as e:
-            logger.error(f"WB API request failed: {str(e)}")
-            raise
+                            return data.get("cards", [])
+
+                        elif response.status == 401:
+                            raise Exception("Invalid API Key")
+
+                        elif response.status == 429:
+                            if attempt < max_retries:
+                                logger.warning(
+                                    f"⏳ Rate limit hit on content-api (attempt {attempt}/{max_retries}), "
+                                    f"waiting {RATE_LIMIT_WAIT}s..."
+                                )
+                                await asyncio.sleep(RATE_LIMIT_WAIT)
+                                continue
+                            else:
+                                raise Exception(
+                                    f"Rate limit exceeded after {max_retries} retries"
+                                )
+
+                        else:
+                            error_text = await response.text()
+                            raise Exception(f"WB API error {response.status}: {error_text}")
+
+            except Exception as e:
+                if "Rate limit" not in str(e) or attempt >= max_retries:
+                    logger.error(f"WB content-api request failed (attempt {attempt}): {str(e)}")
+                    raise
+
+        raise Exception("Unexpected end of retry loop")
 
     async def get_stocks_report(
         self,

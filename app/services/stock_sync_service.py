@@ -57,18 +57,26 @@ class StockSyncService:
         """
         today = today or date.today()
 
+        # Только активные товары: неактивные (деактивированные вручную или как
+        # устаревшие дубли marketplace_sku при синке товаров) остатками не
+        # обновляются — иначе «передача» остатка новому товару откатывалась бы
+        # на каждом следующем синке
         products = self.db.query(Product).filter(
             Product.tenant_id == tenant_id,
             Product.marketplace_sku.isnot(None),
             Product.marketplace_sku != "",
+            Product.is_active.is_(True),
         ).all()
 
         if not products:
             logger.info(f"ℹ️ Нет товаров для синхронизации остатков (tenant_id={tenant_id})")
             return {"products_processed": 0, "products_updated": 0}
 
-        nm_id_to_sku: Dict[str, str] = {}
-        nm_ids: List[int] = []
+        # Один nmId может соответствовать нескольким sku (разные внутренние
+        # артикулы продавца на одну карточку WB — допустимо при ручном создании).
+        # Маппим nmId → СПИСОК sku, иначе один товар-дубль перезапишет другого
+        # и остаток запишется только последнему.
+        nm_id_to_skus: Dict[int, List[str]] = {}
         for product in products:
             try:
                 nm_id = int(product.marketplace_sku)
@@ -77,8 +85,9 @@ class StockSyncService:
                     f"⚠️ Некорректный marketplace_sku у продукта {product.sku}: {product.marketplace_sku}"
                 )
                 continue
-            nm_ids.append(nm_id)
-            nm_id_to_sku[str(nm_id)] = product.sku
+            nm_id_to_skus.setdefault(nm_id, []).append(product.sku)
+
+        nm_ids = list(nm_id_to_skus.keys())
 
         if not nm_ids:
             return {"products_processed": 0, "products_updated": 0}
@@ -98,11 +107,12 @@ class StockSyncService:
         periods = self._target_periods(week_start, today)
 
         updated_count = 0
-        for nm_id, sku in nm_id_to_sku.items():
-            quantity = quantity_by_nm_id.get(nm_id, 0)
-            for period_month in periods:
-                self._upsert_stock(tenant_id, sku, nm_id, period_month, quantity)
-            updated_count += 1
+        for nm_id, skus in nm_id_to_skus.items():
+            quantity = quantity_by_nm_id.get(str(nm_id), 0)
+            for sku in skus:
+                for period_month in periods:
+                    self._upsert_stock(tenant_id, sku, str(nm_id), period_month, quantity)
+                updated_count += 1
 
         self.db.commit()
 

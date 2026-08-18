@@ -1,15 +1,22 @@
 # app/services/product_sync_service.py
+import asyncio
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from typing import List, Dict, Any, Optional
 import logging
 from datetime import date, datetime
 from app.models.product import Product
+from app.models.product_stock import ProductStockMonthly
 from app.crud.product_crud import create_product, get_product_by_sku, update_product
 from app.schemas.product import ProductCreate, ProductUpdate
 from app.services.wb_api_client import WBAPIClient
 
 logger = logging.getLogger(__name__)
+
+# Пауза между последовательными запросами фото к WB Content API:
+# за один синк может создаться много новых товаров, а подряд идущие вызовы
+# без задержки легко ловят 429 (см. WBAPIClient.get_product_data_by_sku)
+PHOTO_FETCH_DELAY_SECONDS = 1
 
 class ProductSyncService:
     def __init__(self, db: Session):
@@ -90,6 +97,61 @@ class ProductSyncService:
 
         return photos[0].get('square') or None
 
+    def _consolidate_marketplace_sku_duplicate(self, tenant_id: int, new_product: Product) -> Dict[str, int]:
+        """
+        Консолидация дублей по marketplace_sku при синке из WB-отчётов.
+
+        Свежие данные из WB считаются актуальными: если у созданного товара
+        оказался тот же marketplace_sku, что и у существующих товаров тенанта,
+        существующие деактивируются, а их остатки за текущий и будущие месяцы
+        удаляются (история за прошлые месяцы сохраняется — она не искажает
+        аналитику закрытых периодов).
+
+        Переносить остатки новому товару вручную не нужно: шаг синка остатков
+        (StockSyncService) идёт сразу после синка товаров и запишет новому
+        (активному) товару полный остаток WB-карточки по nmId.
+
+        Внимание: эта логика — только для пути синка. Ручное создание товара
+        с фронта с тем же marketplace_sku НЕ деактивирует существующие
+        (там показывается предупреждение, оба остаются активными).
+        """
+        duplicates = self.db.query(Product).filter(
+            Product.tenant_id == tenant_id,
+            Product.marketplace_sku == new_product.marketplace_sku,
+            Product.id != new_product.id,
+        ).all()
+
+        if not duplicates:
+            return {'deactivated': 0, 'stock_rows_deleted': 0}
+
+        current_month_start = date.today().replace(day=1)
+        duplicate_skus = [d.sku for d in duplicates]
+
+        # Деактивируем только активных, но хвосты остатков чистим у всех
+        # (могли остаться с прошлых синков до появления этой логики)
+        deactivated = 0
+        for dup in duplicates:
+            if dup.is_active:
+                dup.is_active = False
+                dup.updated_at = datetime.utcnow()
+                deactivated += 1
+
+        stock_rows_deleted = self.db.query(ProductStockMonthly).filter(
+            ProductStockMonthly.tenant_id == tenant_id,
+            ProductStockMonthly.sku.in_(duplicate_skus),
+            ProductStockMonthly.period_month >= current_month_start,
+        ).delete(synchronize_session=False)
+
+        self.db.commit()
+
+        logger.info(
+            f"🔁 Консолидация дублей marketplace_sku={new_product.marketplace_sku} "
+            f"(tenant_id={tenant_id}): деактивировано {deactivated} из {len(duplicates)} "
+            f"[{', '.join(duplicate_skus)}], удалено строк остатков с {current_month_start}: "
+            f"{stock_rows_deleted}. Остаток новому товару {new_product.sku} запишет синк остатков."
+        )
+        return {'deactivated': deactivated, 'stock_rows_deleted': stock_rows_deleted}
+
     async def sync_products_from_period(self, tenant_id: int, date_from: date, date_to: date, api_key: Optional[str] = None) -> Dict[str, int]:
         """Синхронизируем продукты из отчетов за период"""
 
@@ -123,9 +185,18 @@ class ProductSyncService:
                     created_count += 1
                     logger.debug(f"✅ Создан продукт: {sku}")
 
+                    # Если у нового товара тот же marketplace_sku, что и у существующих —
+                    # деактивируем старые дубли и чистим их остатки текущего месяца+
+                    # (новому товару остатки запишет последующий шаг синка остатков)
+                    self._consolidate_marketplace_sku_duplicate(tenant_id, new_product)
+
                     # Фото подтягиваем только для нового товара — если у существующего
                     # его нет, это не повод дёргать WB API при каждой синхронизации.
                     if api_key:
+                        # Пауза между фото-запросами: за один синк новых товаров
+                        # может быть много, подряд идущие вызовы Content API
+                        # без задержки легко ловят 429
+                        await asyncio.sleep(PHOTO_FETCH_DELAY_SECONDS)
                         photo_url = await self.fetch_product_photo(api_key, sku)
                         if photo_url:
                             update_product(self.db, new_product.id, ProductUpdate(foto=photo_url))
