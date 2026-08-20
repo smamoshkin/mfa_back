@@ -1,0 +1,29 @@
+# Данные сервисов
+postgres_data/
+redis_data/
+celerybeat_data/
+backup/
+logs/
+ssl/
+
+# Секреты и окружение
+.env
+*.log
+*.pid
+.git
+.gitignore
+.github/
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Мусор и архивы
+*.zip
+.DS_Store
+requirements-full-backup.txt
+requirements copy.txt
+celerybeat-schedule.db

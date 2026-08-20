@@ -1,18 +1,34 @@
-FROM python:3.11-slim
+# syntax=docker/dockerfile:1
 
-WORKDIR /app
+# ---- Этап сборки зависимостей ----
+FROM python:3.11-slim AS builder
 
-# Устанавливаем системные зависимости
-RUN apt-get update && apt-get install -y \
+WORKDIR /build
+
+# Компиляторы нужны только здесь, в финальный образ не попадут
+RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
+    libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Копируем зависимости и устанавливаем их
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
-# Копируем весь код приложения
+# ---- Финальный образ ----
+FROM python:3.11-slim
+
+# libpq5 — рантайм-библиотека для psycopg2 (без заголовков и компиляторов)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /backend
+
+COPY --from=builder /install /usr/local
 COPY . .
 
-# Команда для запуска FastAPI
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+RUN chmod +x /backend/entrypoint.sh
+
+EXPOSE 8000
+
+ENTRYPOINT ["/backend/entrypoint.sh"]
