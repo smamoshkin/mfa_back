@@ -108,3 +108,5 @@ docker-data/
 postgres-data/
 data/
 tmp/
+# Локальный runbook (адреса, восстановление БД) — не для Git
+LOCAL_RUNBOOK.md
