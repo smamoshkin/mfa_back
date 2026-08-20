@@ -4,7 +4,7 @@ from sqlalchemy import text
 from app.database.database import get_db, engine
 from app.models import Base
 from app.models import tenant, product, product_cost, supplier_report  # импорт моделей для создания таблиц
-from app.routers import products, debug, product_costs, supplier_reports, sync, celery_tasks, auth, analytics, periodic_sync, dashboard, tax_rates, tenants  # импортируем роутеры
+from app.routers import products, debug, product_costs, supplier_reports, sync, celery_tasks, auth, analytics, periodic_sync, tax_rates, tenants  # импортируем роутеры
 import logging
 import os
 from fastapi.middleware.cors import CORSMiddleware
@@ -48,7 +48,6 @@ app.include_router(supplier_reports.router)
 app.include_router(sync.router) 
 app.include_router(celery_tasks.router)
 app.include_router(periodic_sync.router)
-app.include_router(dashboard.router)
 app.include_router(tax_rates.router)
 
 # # Создаем таблицы в БД
