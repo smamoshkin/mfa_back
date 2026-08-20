@@ -499,6 +499,13 @@ docker compose exec -T db psql -U marketfinance_user -d marketfinance_db < db/ma
 
 ---
 
+## Эксплуатация
+
+- **CI/CD, релизы и откаты** — см. `DEPLOY.md`
+- **Мониторинг и алерты** — см. `MONITORING.md` (дашборд `/status/`, скрипт health_check.sh, настройки уведомлений)
+
+---
+
 ## Примечания
 
 - Фронтенд подключается с `localhost:5173/5174` (Vite dev server — предположительно React/Vue)
