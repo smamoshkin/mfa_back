@@ -1,14 +1,22 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from typing import List, Optional
 from datetime import date
+import os
 
 from app.database.database import get_db
-from app.schemas.product_cost import ProductCost, ProductCostCreate, ProductCostUpdate
+from app.schemas.product_cost import (
+    ProductCost, ProductCostCreate, ProductCostUpdate,
+    CostImportReport,
+)
 from app.crud import product_cost_crud
-from app.routers.auth import get_current_tenant  
-from app.models.product import Product  
+from app.routers.auth import get_current_tenant
+from app.models.product import Product
+from app.services.cost_import_service import (
+    CostImportService, CostImportError, ALLOWED_EXTENSIONS,
+)
 
 router = APIRouter(
     prefix="/product-costs",
@@ -37,6 +45,71 @@ def create_product_cost(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal server error"
+        )
+
+@router.get("/template")
+def download_cost_template(
+    current_tenant = Depends(get_current_tenant),
+    db: Session = Depends(get_db),
+):
+    """
+    xlsx-шаблон себестоимостей с префиллом: все товары тенанта,
+    текущие себестоимости и даты их начала. Для раундтрипа:
+    скачать → править → загрузить через /import.
+    """
+    service = CostImportService(db)
+    buf = service.generate_template(current_tenant.id)
+    filename = f"product_costs_template_{date.today().strftime('%Y%m%d')}.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+@router.post("/import", response_model=CostImportReport)
+async def import_costs(
+    file: UploadFile = File(...),
+    dry_run: bool = Form(True),
+    current_tenant = Depends(get_current_tenant),
+    db: Session = Depends(get_db),
+):
+    """
+    Импорт себестоимостей из xlsx/csv (колонки: sku, cost, start_date).
+
+    dry_run=True (умолчание) — только предпросмотр: отчёт по строкам
+    (create/update/error) без записи в БД.
+    dry_run=False — применяет импорт: обновляет совпадающие по дате записи,
+    создаёт новые, пересегментирует периоды и обновляет мат.view аналитики.
+    """
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Неподдерживаемый формат файла '{ext}'. Ожидаются: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
+        )
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Файл пуст",
+        )
+
+    service = CostImportService(db)
+    try:
+        return service.process(
+            tenant_id=current_tenant.id,
+            data=data,
+            filename=file.filename,
+            dry_run=dry_run,
+        )
+    except CostImportError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Ошибка импорта себестоимостей: {str(e)}",
         )
 
 @router.get("/product/{product_id}"
