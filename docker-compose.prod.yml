@@ -63,6 +63,7 @@ services:
     environment:
       - DATABASE_URL=postgresql://marketfinance_user:${DB_PASSWORD}@db:5432/marketfinance_db
       - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY}
     depends_on:
       - backend
       - db
@@ -80,6 +81,7 @@ services:
     environment:
       - DATABASE_URL=postgresql://marketfinance_user:${DB_PASSWORD}@db:5432/marketfinance_db
       - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY}
     depends_on:
       - backend
       - db

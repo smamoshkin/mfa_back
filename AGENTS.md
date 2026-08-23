@@ -272,7 +272,7 @@ marketfinanceapp/
 ### Механизм: JWT (HS256)
 - Хеширование паролей: **PBKDF2-SHA256** через passlib
 - Токен: JWT с полем `sub` = tenant_id, `exp` = время истечения (по умолчанию 30 минут)
-- `SECRET_KEY` определён в `app/core/auth.py`
+- `SECRET_KEY` читается из переменной окружения (`.env` на сервере), см. `app/core/auth.py`
 
 ### Поток:
 1. **Регистрация:** POST `/auth/register` → создаёт Tenant с хешированным паролем → возвращает JWT
@@ -434,7 +434,7 @@ docker compose exec -T db psql -U marketfinance_user -d marketfinance_db < db/ma
 
 1. **Нет Alembic миграций:** Папка `alembic/versions/` пуста. Таблицы создаются через `create_all()` при старте. **Не подходит для продакшена.**
 
-2. **Хардкодный SECRET_KEY:** `SECRET_KEY = "your-secret-key-change-in-production"` в `app/core/auth.py`. **Критическая уязвимость для продакшена.**
+2. **SECRET_KEY** передаётся через переменную окружения (без фолбэка — при отсутствии приложение не стартует). Историческая проблема с хардкод-заглушкой исправлена.
 
 3. **Удалённая база данных:** `.env` указывает на внешний сервер (`94.103.91.204`), а не на локальный Docker PostgreSQL.
 

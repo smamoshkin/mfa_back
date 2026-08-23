@@ -1,9 +1,13 @@
 from datetime import datetime, timedelta
+import os
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 
 # Конфигурация
-SECRET_KEY = "your-secret-key-change-in-production"
+# Ключ подписи JWT берётся из окружения (.env на сервере / переменная контейнера).
+# Фолбэка нет намеренно: без ключа приложение не стартует,
+# а не подписывает токни известной заглушкой.
+SECRET_KEY = os.environ["SECRET_KEY"]
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
