@@ -103,13 +103,15 @@ services:
     container_name: wb_nginx
     restart: always
     ports:
-      - "8080:80"
-   #   - "443:443"  # если будет HTTPS
+      - "80:80"      # HTTP: редирект на HTTPS + проверка Let's Encrypt
+      - "443:443"    # HTTPS: основной вход
+      - "8080:80"    # ВРЕМЕННО: старый вход, убрать после перехода на faapp.ru
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./nginx/.htpasswd:/etc/nginx/.htpasswd:ro   # пароль дашборда /status/
       - ./status:/usr/share/nginx/status:ro         # дашборд статуса (генерится health_check.sh)
-      - ./ssl:/etc/nginx/ssl:ro
+      - ./ssl/webroot:/var/www/certbot:ro           # challenge-файлы Let's Encrypt
+      - ./ssl/letsencrypt:/etc/letsencrypt:ro       # сертификаты (продление: certbot renew)
     depends_on:
       - backend
       - frontend

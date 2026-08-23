@@ -60,6 +60,8 @@ jobs:
           script: |
             cd /home/market_app/marketfinanceapp
             export BACKEND_TAG=${{ needs.build.outputs.tag }}
+            # закрепляем версию в .env — compose не "сползёт" на latest при последующих up
+            grep -q "^BACKEND_TAG=" .env && sed -i "s/^BACKEND_TAG=.*/BACKEND_TAG=${{ needs.build.outputs.tag }}/" .env || echo "BACKEND_TAG=${{ needs.build.outputs.tag }}" >> .env
             docker compose pull backend celery_worker celery_beat
             docker compose up -d --force-recreate backend celery_worker celery_beat
             docker image prune -f
