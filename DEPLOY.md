@@ -35,6 +35,15 @@ git push origin v1.2.0
 cd /home/market_app/marketfinanceapp
 BACKEND_TAG=v1.1.0 docker compose up -d backend celery_worker celery_beat   # или FRONTEND_TAG для фронта
 ```
+Версии образов закреплены в `.env` сервера (`BACKEND_TAG`/`FRONTEND_TAG`), workflow обновляет их при деплое.
+
+## Домен и HTTPS
+
+- Приложение: **https://faapp.ru** (www — редиректится, http → https)
+- Сертификат Let's Encrypt: `~/marketfinanceapp/ssl/letsencrypt/`
+- Автопродление: cron `~/bin/certbot_renew.sh` (2 раза в сутки), при обновлении — reload nginx + email
+- Логи продления: `~/marketfinanceapp/status/certbot.log`
+- Вход только через домен: порты 80 (редирект + ACME) и 443; 8080 закрыт
 
 ## Разовая инициализация (уже сделано — для справки)
 
@@ -49,5 +58,5 @@ BACKEND_TAG=v1.1.0 docker compose up -d backend celery_worker celery_beat   # и
 ## Замечания
 
 - Postgres/Redis — официальные образы, не пересобираются, данные в volumes.
-- Фронтенд: `npm run build` = `vite build` (проверка типов отключена — 73 ошибки TS в коде, почистить отдельной задачей; проверять руками через `npm run typecheck`).
+- Фронтенд: `npm run build` = `tsc -b && vite build` (проверка типов включена).
 - Миграций Alembic нет (таблицы создаёт `create_all()` при старте) — шаг миграций в деплое появится, когда появятся миграции.

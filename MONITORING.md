@@ -4,9 +4,10 @@
 
 ## Дашборд
 
-- URL: `http://<ip сервера>:8080/status/` (basic auth, креды у владельца)
+- URL: `https://faapp.ru/status/` (basic auth, креды у владельца)
 - Статусы: зелёный (ok) / жёлтый (warn) / красный (fail) по каждой проверке
 - Автообновление страницы — каждые 15 сек; сами проверки выполняются по cron раз в час
+- Проверки API/фронта/домена идут через основной вход `https://faapp.ru` (включая срок сертификата)
 - Стек: статическая страница `status/index.html` читает `status/status.json`, оба файла отдаёт nginx-контейнер (см. `location /status/` в `nginx/nginx.conf`)
 
 ## Скрипт-санитар `~/bin/health_check.sh` (на сервере)
@@ -23,7 +24,8 @@
 |---|---|
 | Контейнеры (7 шт: backend, frontend, nginx, celery, celery_beat, db, redis) | running и не в цикле рестартов |
 | API | `GET /api/docs` отвечает 200 |
-| Фронтенд | `GET /` отвечает 200 |
+| Фронтенд | `GET https://faapp.ru/login` отвечает 200 |
+| Домен | `GET https://faapp.ru/` 200 + срок действия сертификата |
 | БД | ответ на `SELECT 1` (+ размер БД в detail) |
 | Celery | `celery inspect ping` — воркер отвечает |
 | Синхронизация WB | последняя успешная задача в `tenant_sync_jobs` не старше 8 дней (sync еженедельный) |

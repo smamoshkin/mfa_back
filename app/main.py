@@ -31,8 +31,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173",
                    "http://localhost:5174",
-                   "http://188.127.240.202",
-    		   "http://188.127.240.202:8080"],  # Vite dev server
+                   "https://faapp.ru",
+                   "https://www.faapp.ru"],  # Vite dev server + прод-домен
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
