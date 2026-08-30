@@ -18,6 +18,7 @@ celery_app = Celery(
     include=[
         'app.tasks.sync_tasks',
         'app.tasks.periodic_sync',   # регистрируем periodic задачи
+        'app.tasks.email_tasks',     # отправка писем (верификация, сброс пароля)
     ]
 )
 

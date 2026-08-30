@@ -126,6 +126,48 @@ services:
     networks:
       - wb_network
 
+  # Собственный почтовый сервер (SMTP + IMAP) — verификация email и сброс пароля
+  # Настройка: см. mail/README.md (ящики, DKIM, DNS-записи)
+  mailserver:
+    image: ghcr.io/docker-mailserver/docker-mailserver:latest
+    container_name: wb_mailserver
+    hostname: mail.faapp.ru
+    restart: always
+    ports:
+      - "25:25"      # приём/отправка почты (MTA)
+      - "143:143"    # IMAP (support@faapp.ru)
+      - "587:587"    # submission — приложение отправляет письма сюда
+      - "993:993"    # IMAPS
+    volumes:
+      - ./mail/docker-mailserver/config:/tmp/docker-mailserver
+      - ./mail/data:/var/mail
+      - ./mail/state:/var/mail-state
+      - ./ssl/letsencrypt:/etc/letsencrypt:ro   # сертификаты LE (live/mail.faapp.ru), см. mail/README
+    environment:
+      - ENABLE_IMAP=1
+      - ENABLE_RSPAMD=1        # DKIM-подпись исходящих + антиспам входящих
+      - ENABLE_CLAMAV=0        # антивирус не нужен, экономим память
+      - ENABLE_FAIL2BAN=1
+      - SSL_TYPE=letsencrypt
+      - PERMIT_DOCKER=none     # не доверять контейнерной сети как релею!
+    cap_add:
+      - NET_ADMIN              # для fail2ban
+    networks:
+      - wb_network
+
+  # Mailpit — девелоперский SMTP-перехватчик (только с --profile dev)
+  # docker compose --profile dev up -d mailpit
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: wb_mailpit
+    profiles: ["dev"]
+    restart: unless-stopped
+    ports:
+      - "1025:1025"   # SMTP (без авторизации и TLS)
+      - "8025:8025"   # веб-интерфейс для просмотра писем
+    networks:
+      - wb_network
+
 networks:
   wb_network:
     driver: bridge
