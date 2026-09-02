@@ -78,9 +78,8 @@ marketfinanceapp/
 │   └── tasks/                        # Celery фоновые задачи
 │       ├── sync_tasks.py             # Задача синхронизации тенанта
 │       └── periodic_sync.py          # Еженедельная синхронизация всех тенантов
-├── alembic/                          # Настройки миграций (версии отсутствуют)
 ├── db/                               # DDL скрипки БД
-│   ├── tables/                       # Создание таблиц (tenants, products, product_costs, supplier_reports, tax_rates)
+│   ├── tables/                       # Создание таблиц (tenants, products, product_costs, supplier_reports, tax_rates, auth_tokens, pd_consents)
 │   └── views/                        # Создание представлений (supplier_reports_aggregated_v, product_margins_month_v)
 ├── docker-compose.yml                # PostgreSQL + Redis + backend
 ├── Dockerfile                        # Образ на базе python:3.11-slim
@@ -432,7 +431,7 @@ docker compose exec -T db psql -U marketfinance_user -d marketfinance_db < db/ma
 
 ## Известные проблемы и технические долги
 
-1. **Нет Alembic миграций:** Папка `alembic/versions/` пуста. Таблицы создаются через `create_all()` при старте. **Не подходит для продакшена.**
+1. **Нет автомиграций (осознанная конвенция):** Alembic удалён (не использовался). Таблицы создаются через `create_all()` при старте (только несуществующие); изменения схемы раскатываются вручную DDL-скриптами из `db/` (см. db/tables, db/scripts, db/views, db/materialized_views).
 
 2. **SECRET_KEY** передаётся через переменную окружения (без фолбэка — при отсутствии приложение не стартует). Историческая проблема с хардкод-заглушкой исправлена.
 
@@ -512,3 +511,70 @@ docker compose exec -T db psql -U marketfinance_user -d marketfinance_db < db/ma
 - CORS настроен для `http://localhost:5173`, `http://localhost:5174` и `http://94.103.91.204:5173`
 - Папка `/app/api/` существует, но пуста (зарезервирована)
 - Часовой пояс Celery: Europe/Moscow
+
+---
+
+## Changelog сессии 29–30.08.2026 (верификация email, почта, импорт себестоимости, мат.view)
+
+### Аутентификация: верификация email + сброс пароля
+- Регистрация (`POST /auth/register`) БОЛЬШЕ НЕ выдаёт JWT — сначала подтверждение
+  email письмом. Ответ: `{message, email}`.
+- `POST /auth/login` при неподтверждённом email → 403 с заголовком
+  `X-Error-Code: email_unverified` (фронт по нему показывает resend).
+- Новые эндпоинты: `/auth/verify-email` (по токену, сразу логинит),
+  `/auth/resend-verification` (rate limit 60с), `/auth/forgot-password`
+  (всегда 200, не раскрывает email), `/auth/reset-password`,
+  `/auth/validate-reset-token` (без потребления).
+- Токены: `app/core/tokens.py` — одноразовые, в БД только sha256-хэш.
+  Таблица `auth_tokens` (DDL `db/tables/auth_tokens.sql`, применяется вручную).
+  Существующим тенантам проставили `email_verified=true` скриптом
+  `db/scripts/01_mark_existing_verified.sql`.
+- Почта: `app/services/email_service.py` (smtplib, шаблоны в теме приложения)
+  + Celery-задача `app/tasks/email_tasks.py`. Обязательные заголовки
+  `Date`+`Message-ID` ставит приложение (без них amavis карантинит как
+  BAD-HEADER). ENV: SMTP_HOST/PORT/USER/PASSWORD, FROM_EMAIL, APP_URL.
+  Прод: SMTP_HOST=mailserver (сервис compose-сети), порт 587.
+
+### Собственный почтовый сервер (прод)
+- Сервис `mailserver` (docker-mailserver) в docker-compose: SMTP+IMAP,
+  Rspamd/DKIM, fail2ban, LE-сертификаты из ./ssl/letsencrypt.
+- Ящики: `no-reply@faapp.ru` (отправитель приложения), `support@faapp.ru`.
+- Инструкция: `mail/README.md` (DNS, DKIM, TLS, эксплуатация).
+- ⚠️ ВАЖНО: при правках конфигов mailserver — только
+  `docker compose up -d --force-recreate mailserver`; обычный `restart`
+  пропускает применение конфига (проверено на DKIM).
+- Автопродление сертификатов — cron `~/bin/certbot_renew.sh` (2р/день,
+  продлевает оба сертификата, рестартит mailserver).
+
+### Материализованные view аналитики
+- Аналитика читает из `supplier_reports_agg_mv` (подневная) и
+  `product_margins_mv` (помесячная), НЕ из обычных view. DDL:
+  `db/materialized_views/` (+ README). Обычные view остались для
+  dashboard/report_generator.
+- REFRESH CONCURRENTLY — модульная функция
+  `sync_service.refresh_analytics_materialized_views()`; вызывается после
+  каждого синка И после импорта себестоимостей.
+- ⚠️ В мат.view `sale_dt`/`date_from`/`date_to` приводятся к `::timestamp`
+  БЕЗ таймзоны (date→timestamptz зависит от TimeZone сессии — иначе
+  period_month «съезжает» на 3ч и фильтры пустят). Не «чинить» обратно.
+- Уникальный индекс подневной: `(tenant_id, period_day, period_month, sku)` —
+  4 колонки (CASE-логика period_month допускает дубли трёхколоночного ключа).
+
+### Товары: дубли marketplace_sku разрешены
+- Разрешено несколько товаров с одним marketplace_sku (разные sku).
+  Проверка уникальности marketplace_sku УДАЛЕНА из CRUD (create/update).
+- При синке из WB-отчётов: новый товар с существующим marketplace_sku
+  → старые дубли деактивируются + их остатки product_stock_monthly за
+  текущий месяц+ удаляются (`ProductSyncService._consolidate_marketplace_sku_duplicate`).
+  Ручное создание с фронта НЕ деактивирует — только предупреждение.
+- StockSyncService: только is_active=True; маппинг nmId → список sku
+  (дублям достаётся одинаковый остаток карточки WB).
+- Фото товара: ретраи на 429 + пауза 1с между запросами (Content API).
+
+### Импорт себестоимостей из файла
+- `GET /product-costs/template` — xlsx-шаблон с префиллом (раундтрип),
+  `POST /product-costs/import` (multipart file + dry_run) — предпросмотр/
+  применение. Логика: `app/services/cost_import_service.py`.
+- Семантика: совпала start_date → обновить; новая → пересегментация
+  таймлайна (end_date = next.start − 1 день); не найден sku → ошибка строки;
+  дубль в файле → побеждает последняя строка. После коммита — REFRESH мат.view.

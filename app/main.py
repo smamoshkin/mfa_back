@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 from app.database.database import get_db, engine
 from app.models import Base
-from app.models import tenant, product, product_cost, supplier_report  # импорт моделей для создания таблиц
+from app.models import tenant, product, product_cost, supplier_report, pd_consent  # импорт моделей для создания таблиц
 from app.routers import products, debug, product_costs, supplier_reports, sync, celery_tasks, auth, analytics, periodic_sync, tax_rates, tenants  # импортируем роутеры
 import logging
 import os
@@ -14,7 +14,8 @@ logging.basicConfig(level=logging.INFO)
 
 root_path = os.getenv("ROOT_PATH", "")
 
-# Создаем таблицы (временно, потом заменим на Alembic)
+# Создаем недостающие таблицы при старте (DDL для ручной раскатки — в db/tables,
+# конвенция проекта: изменения схемы применяются вручную скриптами из db/)
 tenant.Base.metadata.create_all(bind=engine)
 product.Base.metadata.create_all(bind=engine)
 

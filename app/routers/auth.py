@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from datetime import timedelta, datetime
@@ -7,6 +7,7 @@ import logging
 from app.crud import tenant_crud
 from app.database.database import get_db
 from app.models.tenant import Tenant
+from app.models.pd_consent import PdConsent, DEFAULT_CONSENT_VERSION
 from app.schemas.auth import (
     Token, RegisterResponse, VerifyEmailRequest,
     ResendVerificationRequest, ForgotPasswordRequest, ResetPasswordRequest,
@@ -52,6 +53,7 @@ async def get_current_tenant(
 @router.post("/register", response_model=RegisterResponse)
 def register(
     tenant_data: TenantCreate,
+    request: Request,
     db: Session = Depends(get_db)
 ):
     """
@@ -75,6 +77,25 @@ def register(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Internal server error: {str(e)}"
         )
+
+    # Фиксация согласия на обработку ПД (152-ФЗ: доказательство факта и версии
+    # текста согласия; галка на фронте блокирует регистрацию без отметки).
+    # Сбой записи не должен ломать регистрацию — только лог.
+    try:
+        forwarded = request.headers.get("x-forwarded-for", "")
+        ip = (forwarded.split(",")[0].strip() if forwarded
+              else (request.client.host if request.client else None))
+        db.add(PdConsent(
+            tenant_id=tenant.id,
+            consent_type="pd",
+            text_version=tenant_data.consent_version or DEFAULT_CONSENT_VERSION,
+            ip_address=(ip or "")[:100] or None,
+            user_agent=(request.headers.get("user-agent") or "")[:500] or None,
+        ))
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Failed to record PD consent for tenant {tenant.id}: {e}")
 
     # Токен подтверждения + письмо (фоновая отправка)
     token = auth_tokens.create_token(db, tenant.id, "verify")

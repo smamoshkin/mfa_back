@@ -31,8 +31,10 @@ def create_tenant(db: Session, tenant: TenantCreate):
             detail="Tenant with this email already exists"
         )
     
-    # Создаем словарь данных, исключая пароль
-    tenant_data = tenant.model_dump(exclude={'password'})
+    # Создаем словарь данных, исключая пароль и версию согласия
+    # (consent_version — служебное поле для фиксации согласия в pd_consents,
+    # колонки в tenants у него нет)
+    tenant_data = tenant.model_dump(exclude={'password', 'consent_version'})
     
     # Добавляем хешированный пароль и дату создания
     tenant_data['hashed_password'] = get_password_hash(tenant.password)

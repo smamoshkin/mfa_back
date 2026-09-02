@@ -14,7 +14,11 @@ class TenantBase(BaseModel):
 class TenantCreate(TenantBase):
     name: str
     login_email: EmailStr
-    password: str  
+    password: str
+    # Версия текста согласия на обработку ПД, принятого при регистрации
+    # (документ — docs/legal/02-consent-pd.md во фронте). Если не передан,
+    # бэк записывает DEFAULT_CONSENT_VERSION из app/models/pd_consent.py.
+    consent_version: Optional[str] = None
 
 # Схема для обновления (все поля опциональны)
 class TenantUpdate(BaseModel):

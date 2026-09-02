@@ -7,6 +7,7 @@ from .product_stock import ProductStockMonthly
 from .supplier_report import SupplierReport
 from .tenant_sync_job import TenantSyncJob
 from .auth_token import AuthToken
+from .pd_consent import PdConsent
 
 # Все модели для импорта
-__all__ = ["Base", "Tenant", "TaxRate", "Product", "ProductCost", "ProductStockMonthly", "SupplierReport", "TenantSyncJob", "AuthToken"]
+__all__ = ["Base", "Tenant", "TaxRate", "Product", "ProductCost", "ProductStockMonthly", "SupplierReport", "TenantSyncJob", "AuthToken", "PdConsent"]
