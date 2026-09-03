@@ -19,7 +19,10 @@ logger = logging.getLogger(__name__)
 class DynamicReport:
     """Генератор динамических отчетов с формулами в Excel"""
     
-    # Соответствие колонок БД и русских названий для отчета
+    # Соответствие колонок БД и русских названий для отчета.
+    # Колонки *_per_unit существуют в product_margins_month_v, но в ячейки
+    # отчёта пишутся ФОРМУЛАМИ (=Логистика/Продано, =Маржа/Продано), а не
+    # значениями из БД — см. _per_unit_formulas / _add_horizontal_table_data.
     COLUMN_MAPPING = {
         # Базовые данные
         'product_name': 'Название товара',
@@ -37,11 +40,13 @@ class DynamicReport:
         'regular_deduction': 'Удержание, ₽',
         'dzhem_deduction': 'Джем, ₽',
         'delivery_rub': 'Логистика, ₽',
+        'logistics_per_unit': 'Логистика на единицу, ₽',
         'penalty': 'Штрафы, ₽',
         'acceptance': 'Приемка, ₽',
-        
+
         # Маржа и себестоимость
         'margin': 'Маржа, ₽',
+        'margin_per_unit': 'Маржа на единицу, ₽',
         'cost_per_unit': 'Себестоимость единицы, ₽',
         'total_cost': 'Общая себестоимость, ₽',
         
@@ -309,7 +314,29 @@ class DynamicReport:
             self._apply_header_style(cell)
             col_idx += 1
     
-    def _add_horizontal_table_data(self, sheet, df: pd.DataFrame, start_row: int, 
+    def _per_unit_formulas(self, column_mapping: Dict) -> Dict[str, str]:
+        """
+        Шаблоны формул "на единицу товара" для горизонтальной таблицы:
+        Логистика на единицу = Логистика / Продано,
+        Маржа на единицу = Маржа / Продано.
+        IF(...=0;0;...) — защита от деления на ноль (аналог CASE в view).
+
+        Ключ — русское название колонки, значение — шаблон с {row}.
+        Один и тот же шаблон используется и для строк данных, и для ИТОГО:
+        в строках он ссылается на ячейки этой же строки, в ИТОГО — на ячейки
+        ИТОГО (т.е. на отношение СУММ, а не на сумму по-строчных значений).
+        """
+        qty = get_column_letter(column_mapping['quantity'])
+        delivery = get_column_letter(column_mapping['delivery'])
+        margin = get_column_letter(column_mapping['margin'])
+        return {
+            self.COLUMN_MAPPING['logistics_per_unit']:
+                f"=IF({qty}{{row}}=0,0,{delivery}{{row}}/{qty}{{row}})",
+            self.COLUMN_MAPPING['margin_per_unit']:
+                f"=IF({qty}{{row}}=0,0,{margin}{{row}}/{qty}{{row}})",
+        }
+
+    def _add_horizontal_table_data(self, sheet, df: pd.DataFrame, start_row: int,
                                 column_mapping: Dict) -> int:
         """
         Добавляет данные горизонтальной таблицы
@@ -318,35 +345,50 @@ class DynamicReport:
         # Создаем обратный маппинг: русское название -> номер колонки
         # Ищем русские названия, которые есть в DataFrame
         col_index_by_name = {}
-        
+
         for key, value in column_mapping.items():
             # Берем только строковые ключи, которые являются русскими названиями
             if isinstance(key, str) and key in df.columns:
                 col_index_by_name[key] = value
-        
+
         # print(f"col_index_by_name: {col_index_by_name}")
         # print(f"DataFrame columns: {list(df.columns)}")
-        
+
+        # Формулы "на единицу товара" (вместо готовых значений из БД)
+        per_unit_formulas = self._per_unit_formulas(column_mapping)
+
         # Добавляем данные
         current_row = start_row + 1
-        
+
         # Проходим по строкам DataFrame
         for idx, row_data in df.iterrows():
             # print(f"Processing row {idx}")
-            
+
             # Проходим по всем русским названиям колонок
             for russian_name in df.columns:
                 if russian_name in col_index_by_name:
                     col_idx = col_index_by_name[russian_name]
+
+                    # Колонки "на единицу" — формулы от ячеек этой же строки
+                    if russian_name in per_unit_formulas:
+                        cell = sheet.cell(
+                            row=current_row,
+                            column=col_idx,
+                            value=per_unit_formulas[russian_name].format(row=current_row)
+                        )
+                        self._apply_data_style(cell)
+                        cell.number_format = '#,##0.00'
+                        continue
+
                     value = row_data[russian_name]
-                    
+
                     # Пропускаем NaN значения
                     if pd.isna(value):
                         continue
-                    
+
                     cell = sheet.cell(row=current_row, column=col_idx, value=value)
                     self._apply_data_style(cell)
-                    
+
                     # Форматирование числовых колонок
                     if '₽' in russian_name:
                         cell.number_format = '#,##0.00'
@@ -356,11 +398,11 @@ class DynamicReport:
                         cell.number_format = '#,##0'
                 else:
                     print(f"Warning: {russian_name} not found in col_index_by_name")
-            
+
             current_row += 1
             # if idx < 2:  # Выводим первые несколько строк для отладки
             #     print(f"Row {idx} added at row {current_row-1}")
-        
+
         return current_row - 1  # Последняя строка с данными
     
     def _add_horizontal_total_row(self, sheet, first_data_row: int, last_data_row: int,
@@ -373,12 +415,24 @@ class DynamicReport:
         cell.font = Font(bold=True)
         cell.fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
         cell.border = self._get_border()
-        
+
+        # Для колонок "на единицу" итог — отношение СУММ (СУММ(логистика)/СУММ(продано)
+        # и т.п.): сумма по-строчных per-unit значений математически неверна.
+        # Шаблон с {row}=total_row ссылается на ячейки ИТОГО соответствующих колонок.
+        per_unit_total_formulas = {
+            column_mapping[russian_name]: template.format(row=total_row)
+            for russian_name, template in self._per_unit_formulas(column_mapping).items()
+        }
+
         # Добавляем формулы СУММ для числовых колонок
         for col_idx in range(3, sheet.max_column + 1):
             col_letter = get_column_letter(col_idx)
-            formula = f"=SUM({col_letter}{first_data_row + 1}:{col_letter}{last_data_row})"
-            
+
+            if col_idx in per_unit_total_formulas:
+                formula = per_unit_total_formulas[col_idx]
+            else:
+                formula = f"=SUM({col_letter}{first_data_row + 1}:{col_letter}{last_data_row})"
+
             cell = sheet.cell(row=total_row, column=col_idx, value=formula)
             cell.font = Font(bold=True)
             cell.fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
