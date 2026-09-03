@@ -59,7 +59,10 @@ services:
     container_name: wb_celery
     restart: always
     entrypoint: ""
-    command: celery -A app.celery_app worker --loglevel=info --concurrency=4
+    # max-tasks-per-child: процесс перерождается после 50 задач — pandas не
+    # возвращает память ОС (фрагментация), воркер разбухал до 1.6 ГБ за месяц.
+    # concurrency 2: задачи короткие и редкие, 4 процессов с pandas — лишняя память.
+    command: celery -A app.celery_app worker --loglevel=info --concurrency=2 --max-tasks-per-child=50
     environment:
       - DATABASE_URL=postgresql://marketfinance_user:${DB_PASSWORD}@db:5432/marketfinance_db
       - REDIS_URL=redis://redis:6379/0
