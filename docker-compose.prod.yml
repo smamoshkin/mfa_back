@@ -17,8 +17,8 @@ services:
     restart: unless-stopped
     command: >
       postgres
-      -c shared_buffers=128MB
-      -c effective_cache_size=256MB
+      -c shared_buffers=512MB
+      -c effective_cache_size=2GB
     networks:
       - wb_network
     ports:
