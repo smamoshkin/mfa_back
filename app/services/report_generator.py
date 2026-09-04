@@ -160,9 +160,9 @@ class DynamicReport:
             select_clause = ", ".join(columns_to_select)
             
             query = text(f"""
-                SELECT 
+                SELECT
                     {select_clause}
-                FROM product_margins_month_v
+                FROM product_margins_mv
                 WHERE tenant_id = :tenant_id
                   AND period_month >= :date_from
                   AND period_month <= :date_to
