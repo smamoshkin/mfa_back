@@ -190,3 +190,91 @@ def run_initial_sync_pending_tenants():
 
     finally:
         db.close()
+
+@celery_app.task(name='run_daily_advertising_sync_all_tenants')
+def run_daily_advertising_sync_all_tenants():
+    """
+    Ежедневная догрузка рекламной статистики — запускается каждый день в 07:00 MSK.
+
+    Для всех активных тенантов с валидным WB ключом грузит рекламные данные
+    (/adv/v1/upd + /adv/v3/fullstats) за ВЧЕРАШНИЙ день — чтобы реклама в
+    аналитике не отставала на неделю до ближайшего еженедельного синка.
+
+    Запускает задачу sync_tenant_wb_advertising на каждого тенанта (она сама
+    делает refresh рекламных MV и product_margins_mv после загрузки).
+    Идемпотентно: повторная загрузка того же дня дублей не создаёт; пропущенный
+    день (сервис был недоступен в 07:00) само-залечится еженедельным синком,
+    который покрывает всю прошлую неделю.
+
+    Финансовый отчёт, продукты и остатки этой задачей НЕ трогаются.
+    """
+    from datetime import datetime, timezone
+
+    # Локальный импорт: sync_tasks импортирует SyncService — держим на уровне
+    # функции, как это принято в этом модуле для тяжёлых зависимостей
+    from app.tasks.sync_tasks import sync_tenant_wb_advertising
+
+    db = SessionLocal()
+
+    try:
+        yesterday = date.today() - timedelta(days=1)
+        now = datetime.now(timezone.utc)
+
+        # Та же выборка, что у еженедельного синка, БЕЗ проверки
+        # last_sync_status: рекламные таблицы не пересекаются с финансовыми,
+        # обе загрузки идемпотентны — гонка с ручным синком безопасна
+        tenants = (
+            db.query(Tenant)
+            .filter(
+                and_(
+                    Tenant.is_active == True,
+                    Tenant.sync_enabled == True,
+                    Tenant.needs_initial_sync == False,  # initial sync завершён
+                    Tenant.wb_api_key != None,
+                    Tenant.wb_api_key != "",
+                    (Tenant.wb_api_key_expire_at == None) |
+                    (Tenant.wb_api_key_expire_at > now),
+                )
+            )
+            .all()
+        )
+
+        logger.info(
+            f"📅 Daily advertising sync started | period: {yesterday} | "
+            f"tenants eligible: {len(tenants)}"
+        )
+
+        launched = []
+        for tenant in tenants:
+            try:
+                sync_tenant_wb_advertising.delay(
+                    tenant_id=tenant.id,
+                    date_from=yesterday.isoformat(),
+                    date_to=yesterday.isoformat(),
+                )
+                launched.append(tenant.id)
+            except Exception as e:
+                logger.error(
+                    f"❌ Failed to launch advertising sync for tenant {tenant.id}: {e}",
+                    exc_info=True,
+                )
+
+        logger.info(
+            f"📊 Daily advertising sync summary | "
+            f"total={len(tenants)} | launched={len(launched)} | "
+            f"period={yesterday}"
+        )
+
+        return {
+            "status": "success",
+            "period": yesterday.isoformat(),
+            "total_tenants": len(tenants),
+            "launched": launched,
+        }
+
+    except Exception as e:
+        logger.error(f"❌ Daily advertising sync failed critically: {e}", exc_info=True)
+        raise
+
+    finally:
+        db.close()

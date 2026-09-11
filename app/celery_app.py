@@ -55,10 +55,16 @@ celery_app.conf.update(
 
 celery_app.conf.beat_schedule = {
 
-    # Еженедельная синхронизация — каждый понедельник в 06:00 MSK
+    # Еженедельная синхронизация — каждый понедельник в 10:00 MSK
     'weekly-wb-sync': {
         'task': 'run_weekly_sync_all_tenants',
         'schedule': crontab(hour=10, minute=0, day_of_week=1),
+    },
+
+    # Ежедневная догрузка рекламной статистики за вчера — в 07:00 MSK
+    'daily-advertising-sync': {
+        'task': 'run_daily_advertising_sync_all_tenants',
+        'schedule': crontab(hour=7, minute=0),
     },
 
     # Подхват зависших initial sync — каждый час в :00
