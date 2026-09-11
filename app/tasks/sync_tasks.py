@@ -160,3 +160,85 @@ def _error_result(self, tenant_id, error, sync_type="manual", job_id=None):
         'error': error,
         'failed_at': datetime.utcnow().isoformat(),
     }
+
+
+@celery_app.task(bind=True, name='sync_tenant_wb_advertising')
+def sync_tenant_wb_advertising(
+    self,
+    tenant_id: int,
+    date_from: str,
+    date_to: str,
+):
+    """
+    Догрузка ТОЛЬКО рекламной истории за период (/adv/v1/upd + /adv/v3/fullstats
+    + refresh рекламных MV и product_margins_mv). Финансовый отчёт НЕ трогает.
+
+    Назначение: существующим тенантам, у которых финансовая история загружена
+    до появления рекламного модуля. Новым тенантам не нужен — полный синк
+    тянет рекламу сам.
+
+    Запускается эндпоинтом POST /sync/wb/{tenant_id}/advertising.
+    """
+    from app.services.wb_advertising_service import WBAdvertisingService
+
+    db = SessionLocal()
+
+    try:
+        logger.info(
+            f"🚀 Ad backfill task '{self.request.id}' started | "
+            f"tenant={tenant_id} | period={date_from} → {date_to}"
+        )
+        self.update_state(
+            state='PROGRESS',
+            meta={
+                'tenant_id': tenant_id,
+                'status': 'Loading advertising (upd + fullstats)...',
+                'period': f"{date_from} → {date_to}",
+            },
+        )
+
+        tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+        if not tenant:
+            error_msg = f"Tenant {tenant_id} not found"
+            logger.error(error_msg)
+            return _error_result(self, tenant_id, error_msg, sync_type="ad_backfill")
+        if not tenant.wb_api_key:
+            error_msg = f"WB API key not configured for tenant {tenant_id}"
+            logger.error(error_msg)
+            return _error_result(self, tenant_id, error_msg, sync_type="ad_backfill")
+
+        service = WBAdvertisingService()
+        metrics = asyncio.run(
+            service.sync_advertising_for_period(
+                db=db,
+                tenant=tenant,
+                date_from=date.fromisoformat(date_from),
+                date_to=date.fromisoformat(date_to),
+            )
+        )
+
+        logger.info(
+            f"✅ Ad backfill task '{self.request.id}' completed | tenant={tenant_id} | "
+            f"upd={metrics.get('upd_created')}/{metrics.get('upd_existing')} | "
+            f"fullstats={metrics.get('fullstats_inserted')}/{metrics.get('fullstats_updated')} | "
+            f"mv_refresh={metrics.get('mv_refresh', {}).get('status')}"
+        )
+
+        result = {
+            'status': 'success',
+            'task_id': self.request.id,
+            'tenant_id': tenant_id,
+            'sync_type': 'ad_backfill',
+            'period': f"{date_from} → {date_to}",
+            'metrics': metrics,
+            'completed_at': datetime.utcnow().isoformat(),
+        }
+        self.update_state(state='SUCCESS', meta=result)
+        return result
+
+    except Exception as e:
+        logger.error(f"❌ Ad backfill failed for tenant {tenant_id}: {str(e)}", exc_info=True)
+        return _error_result(self, tenant_id, str(e), sync_type="ad_backfill")
+
+    finally:
+        db.close()

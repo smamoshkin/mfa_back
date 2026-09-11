@@ -10,6 +10,7 @@ from app.services.wb_api_client import WBAPIClient
 from app.services.report_mapper import ReportMapperService
 from app.services.product_sync_service import ProductSyncService  # 👈 Добавляем
 from app.services.stock_sync_service import StockSyncService
+from app.services.wb_advertising_service import WBAdvertisingService
 from app.crud.supplier_report_crud import bulk_create_reports_DEBUG
 from app.models.tenant import Tenant
 import logging
@@ -142,6 +143,19 @@ class SyncService:
                 )
                 metrics['stocks_updated'] = stock_metrics['products_updated']
 
+            # ШАГ СИНХРОНИЗАЦИИ РЕКЛАМЫ (/adv/v1/upd + /adv/v3/fullstats) —
+            # fail-safe: сбой рекламного этапа НЕ валит финансовый синк
+            # (данные supplier_reports уже сохранены). Ошибки пишутся в
+            # отдельный логгер app.wb_advertising.
+            if sync_products and tenant.wb_api_key:
+                ad_metrics = await self._sync_advertising(
+                    db=db,
+                    tenant=tenant,
+                    date_from=date_from,
+                    date_to=date_to
+                )
+                metrics['ad_sync'] = ad_metrics
+
             # ШАГ ОБНОВЛЕНИЯ МАТ.VIEW АНАЛИТИКИ — фоновый пересчёт кеша отчётов.
             # Весь синк идёт в Celery-задаче (не в HTTP-транзакции), поэтому
             # безопасно сделать REFRESH CONCURRENTLY через отдельное autocommit-
@@ -224,6 +238,40 @@ class SyncService:
         except Exception as e:
             logger.error(f"❌ Stock sync failed: {str(e)}")
             return {'products_processed': 0, 'products_updated': 0}
+
+    async def _sync_advertising(
+        self,
+        db: Session,
+        tenant: Tenant,
+        date_from: date,
+        date_to: date
+    ) -> Dict:
+        """
+        Рекламная синхронизация (списания + детализация + refresh рекламных MV).
+
+        Ошибки логируются отдельно (логгер app.wb_advertising) и НЕ валят
+        общий синк: финансовые данные уже сохранены, реклама дотянется
+        следующим запуском (все загрузки идемпотентны).
+        """
+        logger.info(f"🔄 Starting advertising sync for tenant {tenant.id} "
+                    f"from {date_from} to {date_to}")
+
+        try:
+            advertising_service = WBAdvertisingService()
+            stats = await advertising_service.sync_advertising_for_period(
+                db=db,
+                tenant=tenant,
+                date_from=date_from,
+                date_to=date_to
+            )
+            logger.info(f"✅ Advertising sync completed: {stats}")
+            return stats
+
+        except Exception as e:
+            db.rollback()
+            # Лог и в общий поток (контекст синка), и в рекламный логгер
+            logger.error(f"❌ Advertising sync failed (финансовый синк не затронут): {str(e)}")
+            return {'status': 'failed', 'error': str(e)}
 
     def _refresh_analytics_materialized_views(self) -> int:
         """Тонкая обёртка над модульной функцией (см. refresh_analytics_materialized_views)."""

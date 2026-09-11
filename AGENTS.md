@@ -420,11 +420,16 @@ docker compose logs --tail=50 celery_worker
 docker compose logs --tail=50 celery_beat
 ```
 
-Если в релиз входят изменения DDL (например, `db/materialized_views/*.sql`) —
-сначала применить их к прод-БД, потом rebuild:
+Если в релиз входят изменения DDL — сначала применить их к прод-БД, потом rebuild
+(ПОРЯДОК КРИТИЧЕН: если новый код с ORM-моделями стартует раньше DDL, create_all
+создаст обычные таблицы с именами мат.view — см. db/materialized_views/README.md):
 ```bash
+docker compose exec -T db psql -U marketfinance_user -d marketfinance_db < db/tables/wb_ad_expense_operations.sql
+docker compose exec -T db psql -U marketfinance_user -d marketfinance_db < db/tables/wb_ad_product_daily_stats.sql
 docker compose exec -T db psql -U marketfinance_user -d marketfinance_db < db/materialized_views/01_create_supplier_reports_agg_mv.sql
-docker compose exec -T db psql -U marketfinance_user -d marketfinance_db < db/materialized_views/02_create_product_margins_mv.sql
+docker compose exec -T db psql -U marketfinance_user -d marketfinance_db < db/materialized_views/03_create_mv_wb_ad_actual_expense_by_nm_day.sql
+docker compose exec -T db psql -U marketfinance_user -d marketfinance_db < db/materialized_views/04_create_mv_wb_ad_actual_expense_by_nm_month.sql
+docker compose exec -T db psql -U marketfinance_user -d marketfinance_db < db/materialized_views/05_create_product_margins_mv.sql
 ```
 
 ---
@@ -600,3 +605,148 @@ docker compose exec -T db psql -U marketfinance_user -d marketfinance_db < db/ma
   формулы вертикальной KPI-части ссылаются на колонки по буквам, вычисляемым
   динамически из маппинга (`_map_column_indices_to_letters`).
 - Деплой: только rebuild backend (DDL применять нечего).
+
+---
+
+## Changelog сессии 07.09.2026 (реклама WB: фактические расходы по артикулам)
+
+### Суть
+Хранение ежедневной рекламной статистики WB и расчёт ФАКТИЧЕСКИХ рекламных
+расходов по артикулам: списания `/adv/v1/upd` (updSum, день = updTime в МСК)
+аллоцируются на nmId пропорционально `nms[].sum` из `/adv/v3/fullstats`.
+Атрибуция WB (14-дневное окно, sum_price) в расход не превращается.
+
+### Новые объекты БД (применены на локальной и тестовой БД)
+- Таблицы `wb_ad_expense_operations` (факт списаний; идемпотентность
+  UNIQUE(tenant_id, source_hash), sha256 канонического JSON записи WB;
+  updNum — не идентификатор) и `wb_ad_product_daily_stats` (зерно
+  tenant+advert+день+appType+nmId; расход — ТОЛЬКО nms[].sum; upsert по
+  natural key — WB уточняет прошедшие дни). DDL: `db/tables/wb_ad_*.sql` (идемпотентные).
+- Мат.view `mv_wb_ad_actual_expense_by_nm_day` (03) — аллокация факта на nmId;
+  округление до 0.01, последний nmId группы получает остаток копеек
+  (инвариант SUM(allocated)=actual). Ассоциированные артикулы (nms[].sum=0)
+  исключены. `reconciliation_delta_amount` = факт − fullstats.
+- Мат.view `mv_wb_ad_actual_expense_by_nm_month` (04) — месячные итоги по nmId
+  (+ campaigns_count, advertising_days_count).
+- `product_margins_mv` пересоздана (файл 02 → **05**, теперь зависит от 03/04):
+  финансовая логика прежняя, добавлены колонки nm_id (через LEFT JOIN
+  products.marketplace_sku с безопасным кастом varchar→bigint),
+  actual_ad_expense_amount (COALESCE 0), campaigns_count, advertising_days_count,
+  factual_drr_percent (NULL при выручке ≤ 0), margin_after_advertising.
+  Ключ связи с рекламой: tenant_id + месяц + nm_id (+currency='RUB'), НЕ sku.
+  На тестовой БД: 169 строк до и после — размножения нет.
+
+### Код
+- Модели `WBAdExpenseOperation`, `WBAdProductDailyStat` (`app/models/wb_advertising.py`),
+  в `app/models/__init__.py`; ORM-модели рекламных MV — в `analytics_views.py`
+  (`WBAdActualExpenseByNmDayMV/MonthMV`), ProductMarginsMV расширена.
+  В create_all() в main.py рекламные таблицы НЕ добавлялись (конвенция), но
+  ⚠️ create_all всё равно их создаёт, т.к. models/__init__ импортирует всё —
+  эквивалентно DDL (те же констрейнты/индексы, bigserial).
+- Схемы: `app/schemas/wb_advertising.py` (Read/Ingest × 2 + WBAdSpendByNmMonth).
+- CRUD: `app/crud/wb_advertising_crud.py` — create_or_get/bulk_ingest (upd,
+  идемпотентно), bulk_upsert (fullstats, ON CONFLICT DO UPDATE c EXCLUDED,
+  inserted/updated через RETURNING (xmax=0), батчи по 500).
+- Сервис: `app/services/wb_advertising_service.py` (`WBAdvertisingService`) —
+  ingest_upd_records / normalize_fullstats_payload / ingest_fullstats_payload /
+  refresh_advertising_materialized_views (pg_try_advisory_lock 72459103,
+  AUTOCOMMIT, порядок день→месяц→рентабельность, busy → статус skipped_busy) /
+  sync_advertising_for_period (по дню: upd → fullstats → commit; refresh только
+  при полном успехе). Отдельный логгер `app.wb_advertising`.
+- Клиент: WBAPIClient + `adv_base_url` (advert-api.wildberries.ru), методы
+  get_adv_upd (GET /adv/v1/upd) и get_adv_fullstats (POST /adv/v3/fullstats,
+  aggregationInterval=daily). Формат interval.fullstats — по докам WB, на живом
+  ключе проверить при первом синке.
+- SyncService: этап `_sync_advertising` после стоков, fail-safe (сбой рекламы
+  не валит финансовый синк, rollback + лог в оба логгера), метрики в
+  `metrics['ad_sync']`.
+
+### Тесты (pytest — первые в проекте, задел TODO №9)
+- `tests/conftest.py`: TEST_DATABASE_URL (по умолчанию docker-контейнер
+  faapp-test-pg на 127.0.0.1:5433), DATABASE_URL переопределяется ДО импорта
+  app.* (иначе сервисный REFRESH ходил бы в БД из .env); схема: create_all без
+  рекламных объектов + DDL-скрипты (проверяются сами файлы).
+- `tests/test_wb_advertising.py` — 22 теста по всем обязательным кейсам
+  постановки (идемпотентность upd/updNum=0/дубли updNum, МСК-дни, appType,
+  двойной учёт, upsert, аллокация 2085.00/2.33, остаток копеек последнему,
+  месячные счётчики, join с рентабельностью, NULL DRR, изоляция тенантов,
+  advisory lock busy). Запуск: см. README db/materialized_views.
+
+### Инцидент при раскатке на тест (запомнить)
+Локальный dev-сервер с --reload подхватил новые ORM-модели MV раньше, чем
+применили DDL → create_all создал ТАБЛИЦЫ с именами mv_wb_ad_* на тестовой БД
+→ DROP MATERIALIZED VIEW падал (WrongObjectType). Вылечено: DROP TABLE ...
+CASCADE + повторное применение. На проде: DDL СТРОГО ДО деплоя кода.
+
+### Фикс после первого живого синка (07.09.2026, 405 на fullstats)
+- Первый синк на тесте: /adv/v1/upd отработал (11 операций, идемпотентность
+  ок), а /adv/v3/fullstats падал с 405 Method Not Allowed — метод был
+  реализан как POST (по образцу v1/v2), а v3 по OpenAPI WB — **GET** с
+  параметрами в query string: `ids` (≤50 через запятую), `beginDate`,
+  `endDate` (YYYY-MM-DD, окно ≤31 день), лимит ~3 запроса/мин.
+- `get_adv_fullstats` переписан на GET (+ защиты: >50 кампаний или >31 дня —
+  ValueError, нарезка в вызывающем коде).
+- `sync_advertising_for_period` перестроена под лимиты: upd по дням (пауза
+  1.5с), fullstats ОКНАМИ ≤31 день × чанками ≤50 кампаний с паузой 21с —
+  историческая загрузка за 6 недель = единицы запросов вместо 42+.
+- Проверено живым API (ключ тенанта 8, read-only): upd 11 операций →
+  fullstats 200, структура campaigns→days→apps→nms с nmId/sum/sum_price —
+  парсер совпадает. После упавшего синка таблицы были пусты (rollback
+  сработал), повторный синк загрузит всё с нуля без дублей.
+
+### Оптимизация после второго живого синка (07.09.2026)
+- Второй синк прошёл целиком: 516 списаний (358 378 ₽) за 42 дня, fullstats
+  2 393 товарные строки (2 запроса), MV refreshed за 182 мс. Суммы fullstats
+  (358 876 ₽) сошлись с фактом списаний в пределах ~0,14% — сверочная метрика
+  reconciliation_delta работает.
+- upd качался ПОСУТОЧНО (42 запроса) — по OpenAPI метод принимает диапазон
+  1–31 день, а день расхода и так берётся из updTime каждой записи.
+  Переделано на ОКНА ≤31 день: период 6 недель = 2 запроса upd + 2 fullstats
+  (было 42+2). Лимиты по OpenAPI: upd — 1 запрос/сек (пауза 1,5с),
+  fullstats — ~3 запроса/мин (пауза 21с). Метрика days_processed заменена на
+  windows_processed + upd_requests.
+
+### Excel с рекламой + фикс дублей sku + налоговые ставки (07.09.2026, вечер)
+- **Excel** (`report_generator.py`): источник переключён с обычной
+  `product_margins_month_v` на `product_margins_mv` (там рекламные поля);
+  в детализацию по товарам добавлены 3 колонки В КОНЦЕ таблицы (решение
+  владельца): «Реклама (факт), ₽» (значение, ИТОГО SUM), «DRR факт., %»
+  (формула-отношение =Реклама/Выручка, доля с форматом 0.00%, при выручке
+  ≤0 пусто, ИТОГО — отношение сумм), «Маржа после рекламы, ₽» (формула
+  =Маржа−Реклама, ИТОГО SUM). Вертикальный блок «Ключевые показатели» НЕ
+  меняется (по требованию владельца откатано).
+- **Баг битого xlsx** («Удаленные записи: Формула»): в вертикальный блок
+  была вставлена формула с плейсхолдером {ad_expense}, не добавленным в
+  словарь замен _update_vertical_formulas → в файл уходила формула
+  «={ad_expense}» → Excel её удалял. Устранено откатом вертикали; проверено
+  дампом XML (0 незаменённых плейсхолдеров, XML well-formed).
+- **Дубли sku → один nmId** (переименование артикула продавца, переходный
+  месяц): реклама карточки НЕ дублируется на каждый sku, а распределяется
+  между ними пропорционально выручке месяца, последний — остаток в копейках
+  (при нулевой выручке у всех — поровну). Инвариант Σ рекламы в
+  product_margins_mv = месячной рекламной MV (на тесте: 358 378 = 358 378,
+  до этого задвоение 15 337 ₽ за август). DRR факт. у sku одной карточки
+  совпадает. MV 05 переприменена на тесте.
+- **Налоговые ставки → фоновый REFRESH**: ставка входит в расчёт
+  supplier_reports_agg_mv → product_margins_mv; ручной синхронный вызов
+  refresh_analytics_materialized_views() в tax_rate_crud тормозил интерфейс
+  на ~9с. Заменено на Celery-задачу `refresh_analytics_materialized_views_task`
+  (app/tasks/analytics_tasks.py, include в celery_app.py): .delay() после
+  коммита, при недоступности брокера — warning и деградация (обновит следующий
+  синк). Триггер добавлен во ВСЕ мутации ставки: create/update/delete/close
+  (раньше refresh висел только на create/update, delete/close вообще не
+  обновляли агрегаты).
+
+### Эндпоинт догрузки рекламной истории (07.09.2026, вечер)
+- `POST /sync/wb/{tenant_id}/advertising?date_from&date_to` — бэкфилла ТОЛЬКО
+  рекламы (upd + fullstats + refresh) для существующих тенантов, у которых
+  фин.история загружена до рекламного модуля. Финансовый поток не трогает.
+  Celery-задача `sync_tenant_wb_advertising` (sync_tasks.py), статус —
+  `GET /sync/task/{task_id}/status` (в result.metrics итоги: upd_created/
+  existing, fullstats_inserted/updated, mv_refresh). Идемпотентно.
+- Права: сам тенант всегда; чужой — только с заголовком `X-Admin-Token`
+  = env `SYNC_ADMIN_TOKEN` (режим админа для догрузки пользователям; если
+  переменная не задана — выключен). Задел под TODO №6 (админ-учётка).
+
+- Идемпотентная перезагрузка рекламной истории: синк за диапазон дат
+  (sync_advertising_for_period), дублей не создаёт, fullstats обновляет строки.

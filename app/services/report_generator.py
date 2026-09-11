@@ -20,19 +20,21 @@ class DynamicReport:
     """Генератор динамических отчетов с формулами в Excel"""
     
     # Соответствие колонок БД и русских названий для отчета.
-    # Колонки *_per_unit существуют в product_margins_month_v, но в ячейки
-    # отчёта пишутся ФОРМУЛАМИ (=Логистика/Продано, =Маржа/Продано), а не
-    # значениями из БД — см. _per_unit_formulas / _add_horizontal_table_data.
+    # Колонки *_per_unit / factual_drr / margin_after_advertising существуют в
+    # product_margins_mv, но в ячейки отчёта пишутся ФОРМУЛАМИ
+    # (=Логистика/Продано, =Маржа/Продано, =Реклама/Выручка, =Маржа-Реклама),
+    # а не значениями из БД — см. _ratio_formulas / _row_formulas /
+    # _add_horizontal_table_data.
     COLUMN_MAPPING = {
         # Базовые данные
         'product_name': 'Название товара',
         'sku': 'Артикул',
-        
+
         # Продажи
         'quantity_sold': 'Продано, шт.',
         'revenue': 'Выручка WB, ₽',
         'seller_payout': 'Перечислено продавцу, ₽',
-        
+
         # Расходы
         'tax': 'Налог, ₽',
         'payout_after_tax': 'Перечисление после налога, ₽',
@@ -49,10 +51,17 @@ class DynamicReport:
         'margin_per_unit': 'Маржа на единицу, ₽',
         'cost_per_unit': 'Себестоимость единицы, ₽',
         'total_cost': 'Общая себестоимость, ₽',
-        
+
         # Возвраты
         'return_quantity': 'Возвраты, шт.',
         'return_revenue': 'Возвраты, ₽',
+
+        # Реклама (фактические списания /adv/v1/upd, аллоцированные на артикул
+        # через /adv/v3/fullstats; для sku-дублей одной карточки — по выручке).
+        # По решению владельца рекламные колонки идут В КОНЦЕ таблицы.
+        'actual_ad_expense_amount': 'Реклама (факт), ₽',
+        'factual_drr_percent': 'DRR факт., %',
+        'margin_after_advertising': 'Маржа после рекламы, ₽',
     }
     
     def __init__(self, db_session: Session):
@@ -152,13 +161,18 @@ class DynamicReport:
     
     def _get_report_data(self, filters: Dict, tenant_id: int) -> pd.DataFrame:
         """
-        Запрос к БД для получения всех данных
+        Запрос к БД для получения всех данных.
+
+        Источник — product_margins_mv (материализованная view): тот же,
+        что у страницы «Аналитика» (/analytics/rentability). Содержит и
+        рекламные поля (actual_ad_expense_amount и производные), которых нет
+        в обычной view product_margins_month_v.
         """
         try:
             # Выбираем только нужные колонки
             columns_to_select = list(self.COLUMN_MAPPING.keys())
             select_clause = ", ".join(columns_to_select)
-            
+
             query = text(f"""
                 SELECT
                     {select_clause}
@@ -292,6 +306,8 @@ class DynamicReport:
                 column_mapping['penalty'] = col_idx
             elif english_name == 'acceptance':
                 column_mapping['acceptance'] = col_idx
+            elif english_name == 'actual_ad_expense_amount':
+                column_mapping['ad_expense'] = col_idx
             
             col_idx += 1
         
@@ -314,26 +330,49 @@ class DynamicReport:
             self._apply_header_style(cell)
             col_idx += 1
     
-    def _per_unit_formulas(self, column_mapping: Dict) -> Dict[str, str]:
+    def _ratio_formulas(self, column_mapping: Dict) -> Dict[str, str]:
         """
-        Шаблоны формул "на единицу товара" для горизонтальной таблицы:
+        Шаблоны формул-ОТНОШЕНИЙ для горизонтальной таблицы:
         Логистика на единицу = Логистика / Продано,
-        Маржа на единицу = Маржа / Продано.
-        IF(...=0;0;...) — защита от деления на ноль (аналог CASE в view).
+        Маржа на единицу = Маржа / Продано,
+        DRR факт. = Реклама / Выручка.
+
+        IF(...=0;0;...) — защита от деления на ноль (аналог CASE в MV);
+        для DRR при выручке <= 0 — пустая строка (аналог NULL в MV), не 0.
 
         Ключ — русское название колонки, значение — шаблон с {row}.
         Один и тот же шаблон используется и для строк данных, и для ИТОГО:
         в строках он ссылается на ячейки этой же строки, в ИТОГО — на ячейки
         ИТОГО (т.е. на отношение СУММ, а не на сумму по-строчных значений).
+
+        DRR пишется ДОЛЕЙ (0.13), а не процентами: формат ячейки 0.00%
+        домножает на 100 при отображении.
         """
         qty = get_column_letter(column_mapping['quantity'])
         delivery = get_column_letter(column_mapping['delivery'])
         margin = get_column_letter(column_mapping['margin'])
+        revenue = get_column_letter(column_mapping['revenue'])
+        ad = get_column_letter(column_mapping['ad_expense'])
         return {
             self.COLUMN_MAPPING['logistics_per_unit']:
                 f"=IF({qty}{{row}}=0,0,{delivery}{{row}}/{qty}{{row}})",
             self.COLUMN_MAPPING['margin_per_unit']:
                 f"=IF({qty}{{row}}=0,0,{margin}{{row}}/{qty}{{row}})",
+            self.COLUMN_MAPPING['factual_drr_percent']:
+                f'=IF({revenue}{{row}}<=0,"",{ad}{{row}}/{revenue}{{row}})',
+        }
+
+    def _row_formulas(self, column_mapping: Dict) -> Dict[str, str]:
+        """
+        Шаблоны формул СТРОК (в отличии от отношений — аддитивны, поэтому
+        в ИТОГО считаются обычной SUM):
+        Маржа после рекламы = Маржа - Реклама.
+        """
+        margin = get_column_letter(column_mapping['margin'])
+        ad = get_column_letter(column_mapping['ad_expense'])
+        return {
+            self.COLUMN_MAPPING['margin_after_advertising']:
+                f"={margin}{{row}}-{ad}{{row}}",
         }
 
     def _add_horizontal_table_data(self, sheet, df: pd.DataFrame, start_row: int,
@@ -354,8 +393,12 @@ class DynamicReport:
         # print(f"col_index_by_name: {col_index_by_name}")
         # print(f"DataFrame columns: {list(df.columns)}")
 
-        # Формулы "на единицу товара" (вместо готовых значений из БД)
-        per_unit_formulas = self._per_unit_formulas(column_mapping)
+        # Формульные колонки (вместо готовых значений из БД):
+        # отношения — формулы от ячеек строки; аддитивные — формулы строки
+        # (в ИТОГО у них будет SUM). DRR — доля, формат 0.00% домножает на 100.
+        ratio_formulas = self._ratio_formulas(column_mapping)
+        row_formulas = self._row_formulas(column_mapping)
+        formula_templates = {**ratio_formulas, **row_formulas}
 
         # Добавляем данные
         current_row = start_row + 1
@@ -369,15 +412,18 @@ class DynamicReport:
                 if russian_name in col_index_by_name:
                     col_idx = col_index_by_name[russian_name]
 
-                    # Колонки "на единицу" — формулы от ячеек этой же строки
-                    if russian_name in per_unit_formulas:
+                    # Формульные колонки — формулы от ячеек этой же строки
+                    if russian_name in formula_templates:
                         cell = sheet.cell(
                             row=current_row,
                             column=col_idx,
-                            value=per_unit_formulas[russian_name].format(row=current_row)
+                            value=formula_templates[russian_name].format(row=current_row)
                         )
                         self._apply_data_style(cell)
-                        cell.number_format = '#,##0.00'
+                        if '%' in russian_name:
+                            cell.number_format = '0.00%'
+                        else:
+                            cell.number_format = '#,##0.00'
                         continue
 
                     value = row_data[russian_name]
@@ -416,20 +462,22 @@ class DynamicReport:
         cell.fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
         cell.border = self._get_border()
 
-        # Для колонок "на единицу" итог — отношение СУММ (СУММ(логистика)/СУММ(продано)
-        # и т.п.): сумма по-строчных per-unit значений математически неверна.
-        # Шаблон с {row}=total_row ссылается на ячейки ИТОГО соответствующих колонок.
-        per_unit_total_formulas = {
+        # Для колонок-ОТНОШЕНИЙ итог — отношение СУММ (СУММ(логистика)/СУММ(продано),
+        # СУММ(реклама)/СУММ(выручка) и т.п.): сумма по-строчных отношений
+        # математически неверна. Шаблон с {row}=total_row ссылается на ячейки
+        # ИТОГО соответствующих колонок. Аддитивные формульные колонки
+        # (Маржа после рекламы) и статичные суммы — обычная SUM.
+        ratio_total_formulas = {
             column_mapping[russian_name]: template.format(row=total_row)
-            for russian_name, template in self._per_unit_formulas(column_mapping).items()
+            for russian_name, template in self._ratio_formulas(column_mapping).items()
         }
 
         # Добавляем формулы СУММ для числовых колонок
         for col_idx in range(3, sheet.max_column + 1):
             col_letter = get_column_letter(col_idx)
 
-            if col_idx in per_unit_total_formulas:
-                formula = per_unit_total_formulas[col_idx]
+            if col_idx in ratio_total_formulas:
+                formula = ratio_total_formulas[col_idx]
             else:
                 formula = f"=SUM({col_letter}{first_data_row + 1}:{col_letter}{last_data_row})"
 
@@ -456,8 +504,8 @@ class DynamicReport:
         letter_mapping = {}
         # print("col_map: ", column_mapping)
         # Преобразуем удобные имена в буквы колонок
-        for key in ['revenue', 'payout', 'margin', 'quantity', 'storage', 
-                    'regular_deduction', 'dzhem_deduction', 'delivery', 
+        for key in ['revenue', 'payout', 'margin', 'quantity', 'storage',
+                    'regular_deduction', 'dzhem_deduction', 'delivery',
                     'penalty', 'acceptance']:
             if key in column_mapping:
                 col_idx = column_mapping[key]

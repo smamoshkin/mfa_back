@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Date, Numeric
+from sqlalchemy import Column, Integer, BigInteger, String, Date, Numeric
 from .base import Base
 
 class SupplierReportsAggregatedV(Base):
@@ -99,13 +99,20 @@ class SupplierReportsAggMV(Base):
 
 
 class ProductMarginsMV(Base):
-    """Мат.view product_margins_mv — помесячная маржа (аналог ProductMarginsMonthV)."""
+    """Мат.view product_margins_mv — помесячная маржа (аналог ProductMarginsMonthV).
+
+    С 2026-09 дополнена рекламными полями (см. db/materialized_views/05_*.sql):
+    nm_id, actual_ad_expense_amount, campaigns_count, advertising_days_count,
+    factual_drr_percent (NULL при выручке <= 0), margin_after_advertising.
+    Финансовая логика прежних колонок не менялась.
+    """
     __tablename__ = 'product_margins_mv'
 
     tenant_id = Column(Integer, primary_key=True)
     period_month = Column(Date)
     product_name = Column(String)
     sku = Column(String, primary_key=True)
+    nm_id = Column(BigInteger)  # nmId WB (products.marketplace_sku), nullable
     quantity_sold = Column(Integer)
     revenue = Column(Numeric(10, 2))
     seller_payout = Column(Numeric(10, 2))
@@ -127,3 +134,49 @@ class ProductMarginsMV(Base):
     margin_percent_payout = Column(Numeric(10, 2))
     logistics_per_unit = Column(Numeric(10, 2))
     margin_per_unit = Column(Numeric(10, 2))
+    # --- рекламные поля (фактический расход /adv/v1/upd, аллоцированный на nmId) ---
+    actual_ad_expense_amount = Column(Numeric(14, 2))
+    campaigns_count = Column(Integer)
+    advertising_days_count = Column(Integer)
+    factual_drr_percent = Column(Numeric(10, 2))
+    margin_after_advertising = Column(Numeric(14, 2))
+
+
+# ----------------------------------------------------------------------------
+# Рекламные материализованные view (db/materialized_views/03_*.sql, 04_*.sql):
+# аллокация фактических списаний /adv/v1/upd на nmId пропорционально
+# nms[].sum из /adv/v3/fullstats. В create_all() не добавляются — применяются
+# вручную (как и остальные view/мат.view проекта).
+# ----------------------------------------------------------------------------
+
+class WBAdActualExpenseByNmDayMV(Base):
+    """Мат.view mv_wb_ad_actual_expense_by_nm_day — дневная аллокация расходов на nmId."""
+    __tablename__ = 'mv_wb_ad_actual_expense_by_nm_day'
+
+    tenant_id = Column(Integer, primary_key=True)
+    advert_id = Column(BigInteger, primary_key=True)
+    expense_date_msk = Column(Date, primary_key=True)
+    expense_month_msk = Column(Date)
+    nm_id = Column(BigInteger, primary_key=True)
+    currency = Column(String(10), primary_key=True)
+
+    actual_expense_amount = Column(Numeric(14, 2))
+    fullstats_nm_spend_amount = Column(Numeric(14, 2))
+    fullstats_total_spend_amount = Column(Numeric(14, 2))
+    allocation_weight = Column(Numeric(20, 10))
+    allocated_actual_expense_amount = Column(Numeric(14, 2))
+    reconciliation_delta_amount = Column(Numeric(14, 2))
+
+
+class WBAdActualExpenseByNmMonthMV(Base):
+    """Мат.view mv_wb_ad_actual_expense_by_nm_month — месячные итоги расхода по nmId."""
+    __tablename__ = 'mv_wb_ad_actual_expense_by_nm_month'
+
+    tenant_id = Column(Integer, primary_key=True)
+    expense_month_msk = Column(Date, primary_key=True)
+    nm_id = Column(BigInteger, primary_key=True)
+    currency = Column(String(10), primary_key=True)
+
+    allocated_actual_ad_expense_amount = Column(Numeric(14, 2))
+    campaigns_count = Column(Integer)
+    advertising_days_count = Column(Integer)

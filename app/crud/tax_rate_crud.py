@@ -1,4 +1,5 @@
 # crud/tax_rate_crud.py
+import logging
 from datetime import date, datetime
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_, func
@@ -6,9 +7,26 @@ from fastapi import HTTPException, status
 from decimal import Decimal
 from typing import Optional
 
+from app.tasks.analytics_tasks import refresh_analytics_materialized_views_task
 from app.models.tax_rate import TaxRate
 from app.models.tenant import Tenant
 from app.schemas.tax_rate import TaxRateCreate, TaxRateUpdate
+
+logger = logging.getLogger(__name__)
+
+
+def _schedule_analytics_refresh():
+    """Поставить фоновый REFRESH мат.view аналитики после изменения ставки.
+
+    Ставка входит в расчёт supplier_reports_agg_mv → product_margins_mv, обе
+    вьюхи надо пересчитать, но это секунды — поэтому в Celery, не в запросе.
+    Если брокер недоступен, только логируем: агрегаты обновит следующий синк
+    или повторное изменение (синхронный fallback специально не делаем).
+    """
+    try:
+        refresh_analytics_materialized_views_task.delay()
+    except Exception as e:
+        logger.warning(f"Не удалось поставить в очередь фоновый REFRESH мат.view: {e}")
 
 def get_tax_rate(db: Session, tax_rate_id: int, tenant_id: int):
     """Получить налоговую ставку по ID"""
@@ -149,6 +167,8 @@ def create_tax_rate(db: Session, tax_rate: TaxRateCreate, tenant_id: int):
     db.add(db_tax_rate)
     db.commit()
     db.refresh(db_tax_rate)
+
+    _schedule_analytics_refresh()
     
     return db_tax_rate
 
@@ -187,6 +207,9 @@ def update_tax_rate(db: Session, tax_rate_id: int, tax_rate: TaxRateUpdate, tena
     
     db.commit()
     db.refresh(db_tax_rate)
+
+    _schedule_analytics_refresh()
+
     return db_tax_rate
 
 def delete_tax_rate(db: Session, tax_rate_id: int, tenant_id: int):
@@ -197,6 +220,7 @@ def delete_tax_rate(db: Session, tax_rate_id: int, tenant_id: int):
     
     db.delete(db_tax_rate)
     db.commit()
+    _schedule_analytics_refresh()
     return db_tax_rate
 
 def close_tax_rate_period(db: Session, tax_rate_id: int, end_date: date, tenant_id: int):
@@ -207,17 +231,18 @@ def close_tax_rate_period(db: Session, tax_rate_id: int, end_date: date, tenant_
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Налоговая ставка не найдена"
         )
-    
+
     # Проверяем что end_date >= start_date
     if end_date < db_tax_rate.start_date:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Дата окончания не может быть раньше даты начала"
         )
-    
+
     db_tax_rate.end_date = end_date
     db.commit()
     db.refresh(db_tax_rate)
+    _schedule_analytics_refresh()
     return db_tax_rate
 
 def get_tax_rate_history(db: Session, tenant_id: int, date_from: date = None, date_to: date = None):

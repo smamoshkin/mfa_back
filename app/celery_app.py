@@ -19,6 +19,7 @@ celery_app = Celery(
         'app.tasks.sync_tasks',
         'app.tasks.periodic_sync',   # регистрируем periodic задачи
         'app.tasks.email_tasks',     # отправка писем (верификация, сброс пароля)
+        'app.tasks.analytics_tasks',  # фоновый REFRESH мат.view (CRUD налоговых ставок и др.)
     ]
 )
 

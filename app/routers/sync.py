@@ -1,6 +1,8 @@
 # app/routers/sync.py
 
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, status
+import os
+
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, status, Header
 from sqlalchemy.orm import Session
 from datetime import date
 from typing import Optional
@@ -11,7 +13,7 @@ from app.services.sync_service import SyncService
 from app.services.stock_sync_service import StockSyncService
 from app.services.sync_orchestrator import sync_orchestrator
 from app.routers.auth import get_current_tenant
-from app.tasks.sync_tasks import sync_tenant_wb_data
+from app.tasks.sync_tasks import sync_tenant_wb_data, sync_tenant_wb_advertising
 from app.crud import sync_job_crud
 from app.schemas.sync_job import (
     SyncJobResponse,
@@ -154,6 +156,67 @@ async def sync_wb_stocks_now(
         "tenant_id": tenant_id,
         "period_month": today.replace(day=1).isoformat(),
         **stats,
+    }
+
+
+@router.post("/wb/{tenant_id}/advertising")
+async def sync_wb_advertising_backfill(
+    tenant_id: int,
+    date_from: date,
+    date_to: date,
+    x_admin_token: Optional[str] = Header(None, alias="X-Admin-Token"),
+    current_tenant=Depends(get_current_tenant),
+    db: Session = Depends(get_db),
+):
+    """
+    Догрузка ТОЛЬКО рекламной истории за период (/adv/v1/upd + /adv/v3/fullstats
+    + refresh рекламных MV и product_margins_mv). Финансовый отчёт НЕ трогает.
+
+    Назначение: существующим тенантам, у которых финансовая история загружена
+    до появления рекламного модуля (новым синк тянет рекламу сам). Загрузка
+    идемпотентна — повторный запуск за тот же период дублей не создаёт.
+
+    Права: сам тенант — всегда; ДРУГОЙ тенант — только с заголовком
+    X-Admin-Token, равным переменной окружения SYNC_ADMIN_TOKEN (для
+    догрузки рекламной истории пользователям из поддержки; если переменная
+    не задана — режим админа выключен).
+
+    Возвращает task_id: статус и метрики — GET /sync/task/{task_id}/status.
+    """
+    admin_token = os.getenv("SYNC_ADMIN_TOKEN")
+    is_admin = bool(admin_token and x_admin_token and x_admin_token == admin_token)
+
+    if current_tenant.id != tenant_id and not is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cannot sync data for another tenant",
+        )
+
+    if date_from > date_to:
+        raise HTTPException(400, "date_from не может быть позже date_to")
+
+    tenant = db.query(Tenant).filter(Tenant.id == tenant_id).first()
+    if not tenant:
+        raise HTTPException(404, "Tenant not found")
+    if not tenant.wb_api_key:
+        raise HTTPException(400, "WB API Key not configured for this tenant")
+
+    task = sync_tenant_wb_advertising.delay(
+        tenant_id=tenant_id,
+        date_from=date_from.isoformat(),
+        date_to=date_to.isoformat(),
+    )
+
+    return {
+        "sync_launched": True,
+        "task_id": task.id,
+        "tenant_id": tenant_id,
+        "period": f"{date_from} → {date_to}",
+        "sync_type": "ad_backfill",
+        "message": (
+            f"Рекламная догрузка запущена ({date_from} → {date_to}). "
+            f"Статус: GET /sync/task/{task.id}/status"
+        ),
     }
 
 
