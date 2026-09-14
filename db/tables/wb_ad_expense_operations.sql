@@ -6,9 +6,12 @@
 -- день и месяц updTime в Europe/Moscow (посчитаны при записи, хранятся
 -- отдельными колонками, чтобы агрегации не зависели от таймзоны сессии).
 --
--- Идемпотентность: source_hash = sha256 канонического JSON исходной записи
--- WB; UNIQUE (tenant_id, source_hash). updNum НЕ является идентификатором:
--- может повторяться в разных строках и быть 0.
+-- Идемпотентность: идентичность траты = (tenant_id, advert_id,
+-- expense_datetime, expense_amount) — updNum ИСКЛЮЧЁН из идентичности: WB отдаёт
+-- одну и ту же трату то с updNum=0 (УПД не сформирован), то с реальным
+-- номером УПД. source_hash = sha256 этой идентичности (UNIQUE ниже).
+-- ⚠️ История 14.09.2026: хэш по всей записи (с updNum) давал дубли —
+--    одна и та же трата возвращалась API с разными updNum.
 --
 -- Применяется вручную (конвенция проекта), модель: app/models/wb_advertising.py.
 -- Денежные суммы — только NUMERIC (никаких float).
@@ -42,6 +45,7 @@ CREATE TABLE IF NOT EXISTS public.wb_ad_expense_operations (
     CONSTRAINT wb_ad_expense_operations_tenant_id_fkey FOREIGN KEY (tenant_id)
         REFERENCES tenants(id) ON DELETE CASCADE,
     CONSTRAINT uq_wb_ad_expense_ops_tenant_hash UNIQUE (tenant_id, source_hash),
+    CONSTRAINT uq_wb_ad_expense_ops_charge UNIQUE (tenant_id, advert_id, expense_datetime, expense_amount),
     CONSTRAINT ck_wb_ad_expense_ops_amount_nonneg CHECK (expense_amount >= 0)
 );
 

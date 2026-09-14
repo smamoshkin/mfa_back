@@ -2,7 +2,7 @@
 import hashlib
 import json
 from datetime import date, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -18,14 +18,34 @@ MSK = ZoneInfo("Europe/Moscow")
 FULLSTATS_BATCH_SIZE = 500
 
 
-def compute_source_hash(record: dict) -> str:
-    """sha256 канонического JSON записи WB (сортировка ключей, без пробелов).
+def _charge_identity(advert_id: int, expense_dt, upd_sum: Decimal, currency: str = 'RUB') -> str:
+    """Каноническая строка идентичности траты (общая для хэша и миграций)."""
+    from datetime import timezone
+    upd_utc = expense_dt.astimezone(timezone.utc).isoformat()
+    upd_sum_str = str(upd_sum.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+    return f"{advert_id}|{upd_utc}|{upd_sum_str}|{currency}"
 
-    Идемпотентность /adv/v1/upd: одинаковая исходная запись WB даёт одинаковый
-    хэш → повторный импорт не создаёт дубль (UNIQUE tenant_id + source_hash).
+
+def compute_source_hash(record: dict) -> str:
+    """sha256 СТАБИЛЬНОЙ идентичности траты.
+
+    Идентичность = advert_id + updTime + updSum + валюта.
+    updNum в хэш НЕ входит: WB отдаёт одну и ту же трату то с updNum=0
+    (УПД не сформирован), то с реальным номером УПД — включение updNum
+    давало дубликаты (найдено на тесте 14.09).
+    Пустая строка, если трату не удалось идентифицировать.
     """
-    canonical = json.dumps(record, sort_keys=True, ensure_ascii=False, separators=(',', ':'))
-    return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+    advert_id = record.get('advertId')
+    if advert_id is None:
+        return ''
+    expense_dt, _, _ = parse_upd_time(record.get('updTime'))
+    amount = parse_decimal(record.get('updSum'))
+    if amount is None:
+        return ''
+    return hashlib.sha256(_charge_identity(
+        int(advert_id), expense_dt, amount,
+        str(record.get('currency') or 'RUB'),
+    ).encode('utf-8')).hexdigest()
 
 
 def parse_upd_time(raw_time: Any) -> Tuple[datetime, date, date]:
@@ -123,7 +143,14 @@ def bulk_ingest_expense_operations(
             'total_created_amount': Decimal('0'),
         }
 
-    hashes = [compute_source_hash(r) for r in upd_records]
+    # Дедупликация входного батча: WB может вернуть одну трату дважды
+    # (updNum=0 -> реальный номер УПД) — в пределах батча последняя побеждает
+    unique_by_hash: Dict[str, dict] = {}
+    for record in upd_records:
+        unique_by_hash[compute_source_hash(record)] = record
+    upd_records = list(unique_by_hash.values())
+    hashes = list(unique_by_hash.keys())
+
     existing_hashes = set(
         db.execute(
             select(WBAdExpenseOperation.source_hash).where(

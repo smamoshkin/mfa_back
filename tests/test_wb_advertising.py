@@ -530,3 +530,52 @@ class TestRefreshService:
 
         ok2 = svc.refresh_advertising_materialized_views()
         assert ok2['status'] == 'ok'
+
+
+class TestStableChargeIdentity:
+
+    def test_same_charge_different_updnum_is_same_charge(self, db, tenant_factory):
+        """Реальный кейс с прода/теста (14.09): WB возвращает одну трату дважды —
+        сначала с updNum=0 (УПД не сформирован), затем с реальным номером УПД.
+        Это ОДНА трата: вторая запись не должна создавать дубль."""
+        tenant = tenant_factory()
+        first = upd_record(updNum=0, updSum=2150, updTime="2026-09-12T23:59:59+03:00")
+        second = upd_record(updNum=315200384, updSum=2150, updTime="2026-09-12T23:59:59+03:00")
+        assert first["updNum"] != second["updNum"]  # различается ТОЛЬКО updNum
+
+        service_ingest(db, tenant.id, [first])
+        stats2 = service_ingest(db, tenant.id, [second])
+
+        assert stats2['created_count'] == 0
+        assert stats2['existing_count'] == 1
+        assert db.query(WBAdExpenseOperation).count() == 1
+
+    def test_in_batch_duplicate_same_charge(self, db, tenant_factory):
+        """Дубль ВНУТРИ одного батча тоже схлопывается (keep last)."""
+        tenant = tenant_factory()
+        stats = service_ingest(db, tenant.id, [
+            upd_record(updNum=0, updSum=500, updTime="2026-09-12T10:00:00+03:00"),
+            upd_record(updNum=777, updSum=500, updTime="2026-09-12T10:00:00+03:00"),
+        ])
+        assert stats['created_count'] == 1
+        assert db.query(WBAdExpenseOperation).count() == 1
+
+    def test_hash_ignores_updnum(self):
+        """updNum не участвует в идентичности; updTime/updSum — участвуют."""
+        base = dict(advertId=9, updSum=100, updTime="2026-09-12T10:00:00+03:00")
+        h1 = compute_source_hash({"advertId": 9, "updSum": 100, "updTime": "2026-09-12T10:00:00+03:00", "updNum": 0})
+        h2 = compute_source_hash({"advertId": 9, "updSum": 100, "updTime": "2026-09-12T10:00:00+03:00", "updNum": 999})
+        h3 = compute_source_hash({"advertId": 9, "updSum": 200, "updTime": "2026-09-12T10:00:00+03:00", "updNum": 0})
+        h4 = compute_source_hash({"advertId": 9, "updSum": 100, "updTime": "2026-09-13T10:00:00+03:00", "updNum": 0})
+        assert h1 == h2                      # updNum не влияет
+        assert h1 != h3                      # сумма влияет
+        assert h1 != h4                      # время влияет
+
+    def test_different_currency_different_charge(self, db, tenant_factory):
+        tenant = tenant_factory()
+        stats = service_ingest(db, tenant.id, [
+            upd_record(updSum=100, currency="RUB"),
+            upd_record(updSum=100, currency="USD"),
+        ])
+        assert stats['created_count'] == 2
+        assert db.query(WBAdExpenseOperation).count() == 2
