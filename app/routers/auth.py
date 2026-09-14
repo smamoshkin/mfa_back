@@ -19,6 +19,7 @@ from app.core.auth import (
     create_access_token, verify_token, ACCESS_TOKEN_EXPIRE_MINUTES
 )
 from app.core import tokens as auth_tokens
+from app.core.email_guard import is_disposable_email
 from app.tasks.email_tasks import send_email_task
 
 
@@ -63,6 +64,17 @@ def register(
     """
     try:
         logger.info(f"Starting registration for email: {tenant_data.login_email}")
+
+        # Антибот: домены одноразовой почты (temp-mail и пр.) не допускаем
+        if is_disposable_email(tenant_data.login_email):
+            logger.warning(
+                f"Registration blocked (disposable domain): {tenant_data.login_email}"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Регистрация с одноразовых email-адресов запрещена. "
+                       "Используйте постоянную почту.",
+            )
 
         # Создаем tenant через CRUD функцию
         tenant = tenant_crud.create_tenant(db=db, tenant=tenant_data)
