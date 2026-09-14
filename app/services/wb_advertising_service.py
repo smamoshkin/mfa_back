@@ -17,6 +17,7 @@ from app.crud.wb_advertising_crud import (
     parse_decimal,
 )
 from app.services.wb_api_client import WBAPIClient
+from app.services.aggregates_service import recompute_product_margins, months_in_range
 
 # Отдельный логгер: ошибки рекламной синхронизации не должны смешиваться
 # с ошибками финансового потока supplier_reports (см. SyncService).
@@ -41,11 +42,11 @@ UPD_MAX_DAYS_PER_REQUEST = 31
 UPD_REQUEST_INTERVAL_SECONDS = 1.5          # 1 запрос/сек с запасом
 
 AD_MV_REFRESH_STATEMENTS = [
-    # Порядок строгий: дневная аллокация → месячная сводка → рентабельность
-    # (каждая следующая читает из предыдущей).
+    # Порядок строгий: дневная аллокация → месячная сводка (вторая читает первую).
+    # product_margins_mv здесь больше нет — это обычная таблица, её пересчитывает
+    # aggregates_service.recompute_product_margins() ПОСЛЕ этого REFRESH.
     "REFRESH MATERIALIZED VIEW CONCURRENTLY mv_wb_ad_actual_expense_by_nm_day",
     "REFRESH MATERIALIZED VIEW CONCURRENTLY mv_wb_ad_actual_expense_by_nm_month",
-    "REFRESH MATERIALIZED VIEW CONCURRENTLY product_margins_mv",
 ]
 
 
@@ -192,9 +193,10 @@ class WBAdvertisingService:
     # ------------------------------------------------------------------
 
     def refresh_advertising_materialized_views(self) -> Dict[str, Any]:
-        """REFRESH CONCURRENTLY рекламных MV + product_margins_mv.
+        """REFRESH CONCURRENTLY рекламных MV (день → месяц).
 
-        Порядок строгий: день → месяц → рентабельность.
+        product_margins_mv с 11.09.2026 — обычная таблица product_margins,
+        её пересчитывает recompute_product_margins() (см. sync_advertising_for_period).
 
         - advisory lock (pg_try_advisory_lock): параллельный refresh не
           запускается, при занятом lock возвращается понятный статус;
@@ -345,6 +347,10 @@ class WBAdvertisingService:
                         f"nm_rows={fs_stats['nm_rows_count']}"
                     )
 
-        # --- 3) refresh --------------------------------------------------------
-        totals['mv_refresh'] = self.refresh_advertising_materialized_views()
+        # --- 3) refresh рекламных MV + пересчёт product_margins --------------
+        # Сначала рекламные MV (там аллокация), затем таблица margins —
+        # она читает месячную рекламную MV.
+        totals['ad_mv_refresh'] = self.refresh_advertising_materialized_views()
+        ad_months = months_in_range(date_from, date_to)
+        totals['margins_rows_recomputed'] = recompute_product_margins(db, tenant.id, ad_months)
         return totals

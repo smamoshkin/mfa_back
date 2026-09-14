@@ -5,6 +5,25 @@ from fastapi import HTTPException, status
 from app.models.product_cost import ProductCost
 from app.models.product import Product
 from app.schemas.product_cost import ProductCostCreate, ProductCostUpdate
+from app.services.aggregates_service import recompute_analytics, months_in_range
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def _recompute_for_cost_window(db: Session, tenant_id: int, start_date: date, end_date):
+    """Пересчёт агрегатов за месяцы действия себестоимости (TODO №1).
+
+    Себестоимость вшивается в supplier_reports_agg на пересчёте (LATERAL
+    product_costs), затем product_margins. Месяцы: start_date..end_date
+    (бессрочная → по текущий месяц). Ошибка не валит операцию — агрегаты
+    обновятся следующим триггером (синк/импорт/ставка).
+    """
+    try:
+        months = months_in_range(start_date, end_date or date.today())
+        recompute_analytics(db, tenant_id, months)
+    except Exception as e:
+        logger.error(f"❌ Analytics recompute after cost change failed: {e}")
 
 # def get_product_cost(db: Session, cost_id: int, tenant_id: int = None):
 #     """Получить запись о себестоимости по ID"""
@@ -173,6 +192,7 @@ def create_product_cost(db: Session, cost: ProductCostCreate, tenant_id: int):
         db.commit()
         db.refresh(db_product)
     
+    _recompute_for_cost_window(db, tenant_id, db_cost.start_date, db_cost.end_date)
     return db_cost
 
 def update_product_cost(db: Session, cost_id: int, cost: ProductCostUpdate, tenant_id: int):
@@ -204,6 +224,9 @@ def update_product_cost(db: Session, cost_id: int, cost: ProductCostUpdate, tena
                 detail="Cost record already exists for this date range"
             )
     
+    # Старое окно — до изменений (для пересчёта старого ∪ нового периодов)
+    old_start, old_end = db_cost.start_date, db_cost.end_date
+
     update_data = cost.model_dump(exclude_unset=True)
     for field, value in update_data.items():
         setattr(db_cost, field, value)
@@ -218,6 +241,8 @@ def update_product_cost(db: Session, cost_id: int, cost: ProductCostUpdate, tena
             db_product.current_cost = db_cost.cost
             db.commit()
     
+    # Хвост после end_date тоже затронут (запись могла закрывать открытый период)
+    _recompute_for_cost_window(db, tenant_id, min(old_start, db_cost.start_date), None)
     return db_cost
 
 def delete_product_cost(db: Session, cost_id: int, tenant_id: int):
@@ -230,8 +255,10 @@ def delete_product_cost(db: Session, cost_id: int, tenant_id: int):
         #     detail="Product cost not found or access denied"
         # )
     
+    cost_start, cost_end = db_cost.start_date, db_cost.end_date
     db.delete(db_cost)
     db.commit()
+    _recompute_for_cost_window(db, tenant_id, cost_start, cost_end)
     return db_cost
 
 def close_cost_period(db: Session, cost_id: int, end_date: date, tenant_id: int):
@@ -246,4 +273,7 @@ def close_cost_period(db: Session, cost_id: int, end_date: date, tenant_id: int)
     db_cost.end_date = end_date
     db.commit()
     db.refresh(db_cost)
+    # Закрытие открытого периода убирает себестоимость из ВСЕХ месяцев после
+    # end_date — пересчёт до конца данных (end_date=None в хелпере)
+    _recompute_for_cost_window(db, tenant_id, db_cost.start_date, None)
     return db_cost

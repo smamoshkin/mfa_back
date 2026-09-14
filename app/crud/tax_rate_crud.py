@@ -7,7 +7,7 @@ from fastapi import HTTPException, status
 from decimal import Decimal
 from typing import Optional
 
-from app.tasks.analytics_tasks import refresh_analytics_materialized_views_task
+from app.services.aggregates_service import recompute_analytics, months_in_range
 from app.models.tax_rate import TaxRate
 from app.models.tenant import Tenant
 from app.schemas.tax_rate import TaxRateCreate, TaxRateUpdate
@@ -15,18 +15,19 @@ from app.schemas.tax_rate import TaxRateCreate, TaxRateUpdate
 logger = logging.getLogger(__name__)
 
 
-def _schedule_analytics_refresh():
-    """Поставить фоновый REFRESH мат.view аналитики после изменения ставки.
+def _recompute_for_rate_window(db: Session, tenant_id: int, start_date: date, end_date):
+    """Синхронный пересчёт агрегатов за месяцы действия ставки (TODO №1).
 
-    Ставка входит в расчёт supplier_reports_agg_mv → product_margins_mv, обе
-    вьюхи надо пересчитать, но это секунды — поэтому в Celery, не в запросе.
-    Если брокер недоступен, только логируем: агрегаты обновит следующий синк
-    или повторное изменение (синхронный fallback специально не делаем).
+    Налог вшивается в supplier_reports_agg на пересчёте (джойн tax_rates по
+    sale_dt), затем product_margins. Месяцы: start_date..end_date (бессрочная
+    → по текущий). Пересчёт месяца — миллисекунды; ошибка не валит операцию
+    (агрегаты обновятся следующим триггером: синк/импорт/реклама).
     """
     try:
-        refresh_analytics_materialized_views_task.delay()
+        months = months_in_range(start_date, end_date or date.today())
+        recompute_analytics(db, tenant_id, months)
     except Exception as e:
-        logger.warning(f"Не удалось поставить в очередь фоновый REFRESH мат.view: {e}")
+        logger.error(f"❌ Analytics recompute after tax rate change failed: {e}")
 
 def get_tax_rate(db: Session, tax_rate_id: int, tenant_id: int):
     """Получить налоговую ставку по ID"""
@@ -168,7 +169,7 @@ def create_tax_rate(db: Session, tax_rate: TaxRateCreate, tenant_id: int):
     db.commit()
     db.refresh(db_tax_rate)
 
-    _schedule_analytics_refresh()
+    _recompute_for_rate_window(db, tenant_id, db_tax_rate.start_date, db_tax_rate.end_date)
     
     return db_tax_rate
 
@@ -201,6 +202,9 @@ def update_tax_rate(db: Session, tax_rate_id: int, tax_rate: TaxRateUpdate, tena
                 detail="Обновленные даты пересекаются с существующим периодом"
             )
     
+    # Старое окно — до изменений (пересчитать нужно старое ∪ новое)
+    old_start, old_end = db_tax_rate.start_date, db_tax_rate.end_date
+
     # Применяем обновления
     for field, value in update_data.items():
         setattr(db_tax_rate, field, value)
@@ -208,7 +212,9 @@ def update_tax_rate(db: Session, tax_rate_id: int, tax_rate: TaxRateUpdate, tena
     db.commit()
     db.refresh(db_tax_rate)
 
-    _schedule_analytics_refresh()
+    starts = [d for d in (db_tax_rate.start_date, old_start) if d]
+    ends = [d for d in (db_tax_rate.end_date, old_end, date.today()) if d]
+    _recompute_for_rate_window(db, tenant_id, min(starts), max(ends))
 
     return db_tax_rate
 
@@ -218,9 +224,10 @@ def delete_tax_rate(db: Session, tax_rate_id: int, tenant_id: int):
     if not db_tax_rate:
         return None
     
+    rate_start, rate_end = db_tax_rate.start_date, db_tax_rate.end_date
     db.delete(db_tax_rate)
     db.commit()
-    _schedule_analytics_refresh()
+    _recompute_for_rate_window(db, tenant_id, rate_start, rate_end)
     return db_tax_rate
 
 def close_tax_rate_period(db: Session, tax_rate_id: int, end_date: date, tenant_id: int):
@@ -242,7 +249,9 @@ def close_tax_rate_period(db: Session, tax_rate_id: int, end_date: date, tenant_
     db_tax_rate.end_date = end_date
     db.commit()
     db.refresh(db_tax_rate)
-    _schedule_analytics_refresh()
+    # Закрытие открытой ставки убирает налог из всех месяцев ПОСЛЕ end_date —
+    # пересчёт до конца данных (end_date=None в хелпере)
+    _recompute_for_rate_window(db, tenant_id, db_tax_rate.start_date, None)
     return db_tax_rate
 
 def get_tax_rate_history(db: Session, tenant_id: int, date_from: date = None, date_to: date = None):

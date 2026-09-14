@@ -1,7 +1,7 @@
 # app/services/stock_sync_service.py
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.sql import func
+from sqlalchemy.sql import func, literal_column
 from typing import Dict, List
 from datetime import date
 import logging
@@ -138,5 +138,11 @@ class StockSyncService:
                 "nm_id": stmt.excluded.nm_id,
                 "updated_at": func.now(),
             },
+        ).returning(literal_column('(xmax = 0)').label('inserted'))
+        # xmax=0 -> строка вставлена, иначе обновлена (идемпотентность по ключу
+        # tenant_id + sku + period_month видна в логах)
+        was_inserted = self.db.execute(stmt).scalars().first()
+        logger.info(
+            f"📦 Stock upsert | tenant={tenant_id} sku={sku!r} period={period_month} "
+            f"qty={quantity} | {'INSERTED' if was_inserted in (True, 't', 'true') else 'UPDATED'}"
         )
-        self.db.execute(stmt)

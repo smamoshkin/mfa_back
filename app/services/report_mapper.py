@@ -32,7 +32,14 @@ class ReportMapperService:
             'delivery_rub': raw_data.get('deliveryService'),
             'penalty': raw_data.get('penalty'),
             'acceptance': raw_data.get('paidAcceptance'),
-            'raw_data': raw_data  # 👈 ВСЕ оригинальные данные сохраняем здесь
+            'raw_data': raw_data,  # 👈 ВСЕ оригинальные данные сохраняем здесь
+
+            # Вынесенные из raw_data поля (TODO №1) — дальше живут колонками.
+            # nmId у WB встречается в двух написаниях: 'nmId' и 'nm_id'.
+            'nm_id': self._extract_nm_id(raw_data),
+            'barcode': raw_data.get('sku'),            # в JSON WB 'sku' — штрихкод
+            'subject_name': raw_data.get('subjectName'),
+            'title': raw_data.get('title'),
         }
         
         # Очищаем None значения для обязательных полей
@@ -41,6 +48,15 @@ class ReportMapperService:
         
         return SupplierReportCreate(**mapped_data)
     
+    @staticmethod
+    def _extract_nm_id(raw_data: Dict[str, Any]) -> int | None:
+        """nmId из raw_data (ключи 'nmId' / 'nm_id'), только числовые значения."""
+        for key in ('nmId', 'nm_id'):
+            value = raw_data.get(key)
+            if value is not None and str(value).isdigit():
+                return int(value)
+        return None
+
     def _parse_date(self, date_str: Any) -> datetime.date:
         """Парсит дату из строки"""
         if not date_str:

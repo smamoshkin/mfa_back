@@ -21,7 +21,7 @@ class DynamicReport:
     
     # Соответствие колонок БД и русских названий для отчета.
     # Колонки *_per_unit / factual_drr / margin_after_advertising существуют в
-    # product_margins_mv, но в ячейки отчёта пишутся ФОРМУЛАМИ
+    # product_margins, но в ячейки отчёта пишутся ФОРМУЛАМИ
     # (=Логистика/Продано, =Маржа/Продано, =Реклама/Выручка, =Маржа-Реклама),
     # а не значениями из БД — см. _ratio_formulas / _row_formulas /
     # _add_horizontal_table_data.
@@ -163,10 +163,9 @@ class DynamicReport:
         """
         Запрос к БД для получения всех данных.
 
-        Источник — product_margins_mv (материализованная view): тот же,
-        что у страницы «Аналитика» (/analytics/rentability). Содержит и
-        рекламные поля (actual_ad_expense_amount и производные), которых нет
-        в обычной view product_margins_month_v.
+        Источник — таблица product_margins (TODO №1): тот же, что у страницы
+        «Аналитика» (/analytics/rentability). Содержит и рекламные поля
+        (actual_ad_expense_amount и производные).
         """
         try:
             # Выбираем только нужные колонки
@@ -176,7 +175,7 @@ class DynamicReport:
             query = text(f"""
                 SELECT
                     {select_clause}
-                FROM product_margins_mv
+                FROM product_margins
                 WHERE tenant_id = :tenant_id
                   AND period_month >= :date_from
                   AND period_month <= :date_to

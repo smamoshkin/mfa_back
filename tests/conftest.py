@@ -42,6 +42,8 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 EXCLUDE_FROM_CREATE_ALL = (
     "wb_ad_expense_operations",
     "wb_ad_product_daily_stats",
+    "supplier_reports_agg",
+    "product_margins",
     "supplier_reports_agg_mv",
     "product_margins_mv",
     "mv_wb_ad_actual_expense_by_nm_day",
@@ -54,10 +56,11 @@ EXCLUDE_FROM_CREATE_ALL = (
 DDL_ORDER = [
     ROOT / "db" / "tables" / "wb_ad_expense_operations.sql",
     ROOT / "db" / "tables" / "wb_ad_product_daily_stats.sql",
-    ROOT / "db" / "materialized_views" / "01_create_supplier_reports_agg_mv.sql",
+    ROOT / "db" / "tables" / "supplier_reports_agg.sql",
+    ROOT / "db" / "tables" / "product_margins.sql",
+    ROOT / "db" / "scripts" / "03_supplier_reports_extract_fields.sql",  # колонки supplier_reports
     ROOT / "db" / "materialized_views" / "03_create_mv_wb_ad_actual_expense_by_nm_day.sql",
     ROOT / "db" / "materialized_views" / "04_create_mv_wb_ad_actual_expense_by_nm_month.sql",
-    ROOT / "db" / "materialized_views" / "05_create_product_margins_mv.sql",
 ]
 
 
@@ -96,10 +99,10 @@ def tenant_factory(db):
     from app.models.tenant import Tenant
 
     def _make_tenant():
-        _make_tenant.counter = getattr(_make_tenant, "counter", 0) + 1
+        import uuid
         tenant = Tenant(
-            name=f"Ad Test Tenant {_make_tenant.counter}",
-            login_email=f"ad-test-{_make_tenant.counter}-{id(db):x}@test.local",
+            name=f"Ad Test Tenant {uuid.uuid4().hex[:8]}",
+            login_email=f"ad-test-{uuid.uuid4().hex[:12]}@test.local",
             hashed_password="x",
         )
         db.add(tenant)
@@ -110,13 +113,23 @@ def tenant_factory(db):
 
 
 def refresh_views(engine):
-    """Полный REFRESH цепочки MV (тестам нужен свежий агрегат после вставок).
+    """Пересчёт таблиц агрегатов для всех тенантов + REFRESH рекламных MV.
 
-    AUTOCOMMIT обязателен: REFRESH CONCURRENTLY нельзя в транзакции.
-    Порядок: подневная финансы → рекламные → рентабельность.
+    Порядок (важен): agg (сырьё, там себестоимость/налог) → рекламные MV →
+    product_margins (читает agg и рекламную месячную MV).
     """
+    from app.services.aggregates_service import recompute_supplier_agg, recompute_product_margins
+
     with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-        conn.execute(text("REFRESH MATERIALIZED VIEW supplier_reports_agg_mv"))
         conn.execute(text("REFRESH MATERIALIZED VIEW mv_wb_ad_actual_expense_by_nm_day"))
         conn.execute(text("REFRESH MATERIALIZED VIEW mv_wb_ad_actual_expense_by_nm_month"))
-        conn.execute(text("REFRESH MATERIALIZED VIEW product_margins_mv"))
+
+    Session = sessionmaker(bind=engine)
+    db = Session()
+    try:
+        tenant_ids = [r[0] for r in db.execute(text("SELECT DISTINCT tenant_id FROM supplier_reports"))]
+        for tid in tenant_ids:
+            recompute_supplier_agg(db, tid)
+            recompute_product_margins(db, tid)
+    finally:
+        db.close()

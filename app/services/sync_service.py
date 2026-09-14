@@ -11,7 +11,8 @@ from app.services.report_mapper import ReportMapperService
 from app.services.product_sync_service import ProductSyncService  # 👈 Добавляем
 from app.services.stock_sync_service import StockSyncService
 from app.services.wb_advertising_service import WBAdvertisingService
-from app.crud.supplier_report_crud import bulk_create_reports_DEBUG
+from app.services.aggregates_service import recompute_supplier_agg, recompute_product_margins, months_in_range
+from app.crud.supplier_report_crud import bulk_create_reports
 from app.models.tenant import Tenant
 import logging
 
@@ -83,7 +84,8 @@ class SyncService:
             'last_rrdid': 0,
             'products_synced': 0,  # 👈 Добавляем метрику для продуктов
             'stocks_updated': 0,
-            'mv_refresh_ms': 0     # Время REFRESH мат.view аналитики (0 = не выполнялся)
+            'agg_months_recomputed': 0,   # Месяцев пересчитано в supplier_reports_agg
+            'margins_rows_recomputed': 0, # Строк пересчитано в product_margins
         }
         
         start_time = time.time()
@@ -121,6 +123,20 @@ class SyncService:
                 logger.info("⏳ Waiting 65 seconds before next batch...")
                 await asyncio.sleep(65)
             
+            # ШАГ ПЕРЕСЧЁТА ПОДНЕВНЫХ АГРЕГАТОВ (supplier_reports_agg) —
+            # здесь вшиваются себестоимость (LATERAL product_costs) и налог
+            # (джойн tax_rates по sale_dt). Месяцы = окно синка. Строго ДО
+            # рекламного этапа: product_margins пересчитывается после него.
+            if metrics['total_records'] > 0:
+                agg_months = months_in_range(date_from, date_to)
+                try:
+                    recompute_supplier_agg(db, tenant.id, agg_months)
+                    metrics['agg_months_recomputed'] = len(agg_months)
+                except Exception as e:
+                    # Пересчёт не валит синк: сырые данные сохранены, агрегаты
+                    # обновятся следующим триггером (реклама/ставка/импорт)
+                    logger.error(f"❌ supplier_reports_agg recompute failed: {e}")
+
             # ШАГ СИНХРОНИЗАЦИИ ПРОДУКТОВ
             if sync_products and metrics['total_records'] > 0:
                 products_metrics = await self._sync_products_from_reports(
@@ -156,13 +172,16 @@ class SyncService:
                 )
                 metrics['ad_sync'] = ad_metrics
 
-            # ШАГ ОБНОВЛЕНИЯ МАТ.VIEW АНАЛИТИКИ — фоновый пересчёт кеша отчётов.
-            # Весь синк идёт в Celery-задаче (не в HTTP-транзакции), поэтому
-            # безопасно сделать REFRESH CONCURRENTLY через отдельное autocommit-
-            # соединение. Ошибки рефреша НЕ должны валить синк: сырые данные уже
-            # сохранены, просто отчёт будет строиться по старому снапшоту до
-            # следующего успешного рефреша.
-            metrics['mv_refresh_ms'] = self._refresh_analytics_materialized_views()
+            # ШАГ ПЕРЕСЧЁТА PRODUCT_MARGINS — строго ПОСЛЕ пересчёта agg
+            # (себестоимость/налог) и рекламного этапа (реклама вшивается из
+            # рекламных MV). Месяцы = окно синка. Ошибка не валит синк:
+            # сырые данные сохранены, агрегаты обновятся следующим триггером.
+            if metrics['total_records'] > 0:
+                try:
+                    margins_rows = recompute_product_margins(db, tenant.id, agg_months)
+                    metrics['margins_rows_recomputed'] = margins_rows
+                except Exception as e:
+                    logger.error(f"❌ product_margins recompute failed: {e}")
 
             metrics['total_time'] = time.time() - start_time
 
@@ -340,7 +359,7 @@ class SyncService:
         
         # 3. Вставка в БД
         db_start = time.time()
-        records_imported = bulk_create_reports_DEBUG(db, reports_to_create, tenant.id)
+        records_imported = bulk_create_reports(db, reports_to_create, tenant.id)
         
         db_time = time.time() - db_start
         

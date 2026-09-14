@@ -418,7 +418,7 @@ def margins_row(db, tenant_id, sku):
     return db.execute(text(
         "SELECT revenue, margin, nm_id, actual_ad_expense_amount, campaigns_count,"
         "       advertising_days_count, factual_drr_percent, margin_after_advertising"
-        " FROM product_margins_mv WHERE tenant_id = :t AND sku = :s"
+        " FROM product_margins WHERE tenant_id = :t AND sku = :s"
     ), {"t": tenant_id, "s": sku}).fetchone()
 
 

@@ -21,6 +21,7 @@
 import csv
 import io
 import logging
+import time
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Dict, List, Optional
@@ -36,7 +37,7 @@ from app.schemas.product_cost import (
     CostImportRowReport,
     CostImportSummary,
 )
-from app.services.sync_service import refresh_analytics_materialized_views
+from app.services.aggregates_service import recompute_analytics, months_in_range
 
 logger = logging.getLogger(__name__)
 
@@ -337,12 +338,12 @@ class CostImportService:
 
         mv_refresh_ms = None
         if not dry_run and valid_rows:
-            summary, mv_refresh_ms = self._apply(valid_rows, summary)
+            summary, mv_refresh_ms = self._apply(valid_rows, summary, tenant_id)
 
         return CostImportReport(dry_run=dry_run, rows=rows, summary=summary,
                                 mv_refresh_ms=mv_refresh_ms)
 
-    def _apply(self, valid_rows: List[dict], summary: CostImportSummary) -> tuple:
+    def _apply(self, valid_rows: List[dict], summary: CostImportSummary, tenant_id: int) -> tuple:
         """
         Применяет импорт в одной транзакции:
         update-строки обновляют cost существующих записей, create-строки
@@ -419,10 +420,21 @@ class CostImportService:
             logger.error(f"❌ Cost import failed: {e}", exc_info=True)
             raise
 
-        # Мат.view пересчитываем ПОСЛЕ коммита; ошибка рефреша не валит импорт
-        mv_refresh_ms = refresh_analytics_materialized_views()
+        # Агрегаты (supplier_reports_agg -> product_margins) пересчитываем
+        # ПОСЛЕ коммита: месяцы от минимальной start_date импортированных записей
+        # по текущий месяц. Пересчёт месяца — миллисекунды; ошибка не валит импорт
+        # (агрегаты обновятся следующим триггером).
+        mv_refresh_ms = None
+        try:
+            t0 = time.time()
+            min_start = min(vr["start_date"] for vr in valid_rows)
+            months = months_in_range(min_start, date.today())
+            recompute_analytics(self.db, tenant_id, months)
+            mv_refresh_ms = int((time.time() - t0) * 1000)  # поле историческое: теперь мс пересчёта
+        except Exception as e:
+            logger.error(f"❌ Analytics recompute after cost import failed: {e}")
         logger.info(
             f"🎯 Cost import applied: created={created}, updated={updated}, "
-            f"closed={closed_periods}, mv_refresh={mv_refresh_ms}ms"
+            f"closed={closed_periods}, recompute={mv_refresh_ms}ms"
         )
         return summary, mv_refresh_ms

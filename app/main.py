@@ -15,9 +15,15 @@ logging.basicConfig(level=logging.INFO)
 root_path = os.getenv("ROOT_PATH", "")
 
 # Создаем недостающие таблицы при старте (DDL для ручной раскатки — в db/tables,
-# конвенция проекта: изменения схемы применяются вручную скриптами из db/)
-tenant.Base.metadata.create_all(bind=engine)
-product.Base.metadata.create_all(bind=engine)
+# конвенция проекта: изменения схемы применяются вручную скриптами из db/).
+# Таблицы с info={'skip_create_all': True} НЕ создаются автоматически —
+# их применяет владелец ручным скриптом (например, supplier_reports_agg,
+# product_margins: db/tables/*.sql).
+tables_to_create = [
+    t for t in tenant.Base.metadata.tables.values()
+    if not t.info.get('skip_create_all')
+]
+tenant.Base.metadata.create_all(bind=engine, tables=tables_to_create)
 
 app = FastAPI(
     title="Marketplace Finance API",

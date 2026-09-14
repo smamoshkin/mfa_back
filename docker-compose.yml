@@ -49,6 +49,9 @@ services:
       - SECRET_KEY=${SECRET_KEY}
       - API_WB_KEY=${API_WB_KEY}
       - ROOT_PATH=/api
+      # Токен администратора для /sync/wb/{id}/advertising (догрузка рекламы
+      # чужим тенантам из поддержки). Пусто/не задан -> режим админа выключен.
+      - SYNC_ADMIN_TOKEN=${SYNC_ADMIN_TOKEN}
     depends_on:
       - db
       - redis

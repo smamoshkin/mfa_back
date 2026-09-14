@@ -9,8 +9,10 @@ from .tenant_sync_job import TenantSyncJob
 from .auth_token import AuthToken
 from .pd_consent import PdConsent
 from .wb_advertising import WBAdExpenseOperation, WBAdProductDailyStat
+from .analytics_tables import SupplierReportsAgg, ProductMargins
 
 # Все модели для импорта
 __all__ = ["Base", "Tenant", "TaxRate", "Product", "ProductCost", "ProductStockMonthly",
            "SupplierReport", "TenantSyncJob", "AuthToken", "PdConsent",
-           "WBAdExpenseOperation", "WBAdProductDailyStat"]
+           "WBAdExpenseOperation", "WBAdProductDailyStat",
+           "SupplierReportsAgg", "ProductMargins"]

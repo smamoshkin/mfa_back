@@ -35,10 +35,10 @@ class ProductSyncService:
                     row_number() over (partition by (s.sku) order by s.sale_dt desc) as rn,
                     s.tenant_id,
                     s.sku,
-                    s.raw_data ->> 'nmId' as marketplace_sku,
-                    s.raw_data ->> 'sku' as barcode,
-                    s.raw_data ->> 'subjectName' as category,
-                    s.raw_data ->> 'title' as name
+                    s.nm_id::text as marketplace_sku,
+                    s.barcode as barcode,
+                    s.subject_name as category,
+                    s.title as name
                 FROM public.supplier_reports s
                 WHERE 1=1
                     AND s.date_from >= :date_from

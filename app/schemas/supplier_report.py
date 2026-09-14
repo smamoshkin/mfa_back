@@ -25,6 +25,13 @@ class SupplierReportBase(BaseModel):
     raw_data: Optional[Dict[str, Any]] = None
     extracted_fields: Optional[Dict[str, Any]] = None
 
+    # Вынесенные из raw_data поля (TODO №1). period_month — generated-колонка
+    # в БД, в схеме/вставке не участвует.
+    nm_id: Optional[int] = None
+    barcode: Optional[str] = None
+    subject_name: Optional[str] = None
+    title: Optional[str] = None
+
 class SupplierReportCreate(SupplierReportBase):
     tenant_id: int
 

@@ -47,8 +47,14 @@ SELECT sr.tenant_id,
         END)::date  AS period_month,
     (date_trunc('quarter'::text, sr.sale_dt::timestamp))::date AS period_quarter,
     (date_trunc('year'::text,   sr.sale_dt::timestamp))::date  AS period_year,
-    p.name AS product_name,
-    sr.sku,
+    CASE
+        WHEN sr.sku::text = ''::text OR sr.sku IS NULL THEN '#-=Technical field=-#'::character varying(500)
+        ELSE p.name
+    END AS product_name,
+    CASE
+        WHEN sr.sku::text = ''::text OR sr.sku IS NULL THEN ''::character varying(100)
+        ELSE sr.sku
+    END AS sku,
     sum(
         CASE
             WHEN sr.sku::text = ''::text OR sr.sku IS NULL THEN 0
@@ -138,7 +144,7 @@ SELECT sr.tenant_id,
           WHERE pc_1.product_id = p.id AND pc_1.start_date <= COALESCE(sr.sale_dt::timestamp, CURRENT_DATE::timestamp) AND (pc_1.end_date IS NULL OR pc_1.end_date >= COALESCE(sr.sale_dt::timestamp, CURRENT_DATE::timestamp))
           ORDER BY pc_1.start_date DESC
          LIMIT 1) pc ON true
-  WHERE sr.sku::text <> ''::text AND sr.sku IS NOT NULL
+  WHERE 1 = 1
   GROUP BY sr.tenant_id,
            (date_trunc('day'::text, sr.sale_dt::timestamp)),
            (date_trunc('week'::text, sr.sale_dt::timestamp)),
@@ -151,6 +157,12 @@ SELECT sr.tenant_id,
            p.name, sr.sku
 WITH DATA;
 
+-- ⚠️ ВАЖНО (11.09.2026): НЕ добавлять фильтр `sku <> ''` в WHERE! Строки
+-- хранения/удержания/логистики приходят из WB БЕЗ артикула — фильтр обнуляет
+-- storage_fee и deduction в аналитике. Служебные строки собираются в
+-- техническую группу (sku='', product_name='#-=Technical field=-#'),
+-- приведено к фактически задеплоенной версии мат.view.
+--
 -- Уникальный индекс: обязателен для REFRESH MATERIALIZED VIEW CONCURRENTLY.
 -- ВАЖНО: ключ — (tenant_id, period_day, period_month, sku), а НЕ трёхколоночный.
 -- period_month считается через CASE: корректировка с sale_dt, попавшим за пределы
